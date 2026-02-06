@@ -1,31 +1,34 @@
 """The Scheduler Integration."""
-import logging
-import voluptuous as vol
-import datetime
-import homeassistant.util.dt as dt_util
 
-from homeassistant.helpers import config_validation as cv
-from homeassistant.components.switch import DOMAIN as PLATFORM
+import asyncio
+from dataclasses import asdict
+import datetime
+import logging
+
+import homeassistant.util.dt as dt_util
+import voluptuous as vol
+from homeassistant.components.switch.const import DOMAIN as PLATFORM
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    EVENT_HOMEASSISTANT_STARTED,
-    EVENT_HOMEASSISTANT_STOP,
     ATTR_ENTITY_ID,
     ATTR_NAME,
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_HOMEASSISTANT_STOP,
 )
-from homeassistant.core import HomeAssistant, asyncio, CoreState, callback
+from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.entity_registry import async_get as get_entity_registry
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_send,
 )
+from homeassistant.helpers.entity_registry import async_get as get_entity_registry
 from homeassistant.helpers.event import (
     async_call_later,
-    async_track_state_change_event,
     async_track_point_in_time,
+    async_track_state_change_event,
 )
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from . import const
 from .store import async_get_registry
@@ -79,7 +82,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     @callback
     def async_service_edit_schedule(service):
         match = None
-        for (schedule_id, entity) in hass.data[const.DOMAIN]["schedules"].items():
+        for schedule_id, entity in hass.data[const.DOMAIN]["schedules"].items():
             if entity.entity_id == service.data[const.ATTR_ENTITY_ID]:
                 match = schedule_id
                 continue
@@ -104,7 +107,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     @callback
     def async_service_remove_schedule(service):
         match = None
-        for (schedule_id, entity) in hass.data[const.DOMAIN]["schedules"].items():
+        for schedule_id, entity in hass.data[const.DOMAIN]["schedules"].items():
             if entity.entity_id == service.data["entity_id"]:
                 match = schedule_id
                 continue
@@ -123,16 +126,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     @callback
     def service_copy_schedule(service):
         match = None
-        for (schedule_id, entity) in hass.data[const.DOMAIN]["schedules"].items():
+        for schedule_id, entity in hass.data[const.DOMAIN]["schedules"].items():
             if entity.entity_id == service.data[const.ATTR_ENTITY_ID]:
                 match = schedule_id
                 continue
         if not match:
-            raise vol.Invalid(
-                "Entity not found: {}".format(service.data[const.ATTR_ENTITY_ID])
-            )
+            raise vol.Invalid(f"Entity not found: {service.data[const.ATTR_ENTITY_ID]}")
         else:
             data = store.async_get_schedule(match)
+
+            if data is None:
+                raise vol.Invalid(f"Schedule not found: {match}")
+            
+            data = asdict(data)
+
             tags = coordinator.async_get_tags_for_schedule(data[const.ATTR_SCHEDULE_ID])
             if tags:
                 data[const.ATTR_TAGS] = tags
@@ -157,30 +164,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await coordinator.async_disable_all_schedules()
 
     hass.services.async_register(
-        const.DOMAIN,
-        const.SERVICE_DISABLE_ALL,
-        async_service_disable_all
+        const.DOMAIN, const.SERVICE_DISABLE_ALL, async_service_disable_all
     )
 
     async def async_service_enable_all(service):
         await coordinator.async_enable_all_schedules()
 
     hass.services.async_register(
-        const.DOMAIN,
-        const.SERVICE_ENABLE_ALL,
-        async_service_enable_all
+        const.DOMAIN, const.SERVICE_ENABLE_ALL, async_service_enable_all
     )
-
-    return True
-
-
-async def async_migrate_entry(hass, config_entry: ConfigEntry):
-    """Migrate old entry."""
-    _LOGGER.debug("Migrating from version %s", config_entry.version)
-
-    if config_entry.version == 1:
-        config_entry.version = 2
-        config_entry.data = {"migrate_entities": True}
 
     return True
 
@@ -222,8 +214,12 @@ class SchedulerCoordinator(DataUpdateCoordinator):
         # detect time of prior shutdown to determine which schedules need to be triggered
         time_shutdown = self.store.async_get_time_shutdown()
         if time_shutdown:
-            self.time_shutdown = dt_util.as_local(datetime.datetime.fromisoformat(time_shutdown))
-            _LOGGER.debug("Scheduler detected a shutdown at {}.".format(self.time_shutdown))
+            self.time_shutdown = dt_util.as_local(
+                datetime.datetime.fromisoformat(time_shutdown)
+            )
+            _LOGGER.debug(
+                "Scheduler detected a shutdown at {}.".format(self.time_shutdown)
+            )
         else:
             self.time_shutdown = None
 
@@ -279,7 +275,7 @@ class SchedulerCoordinator(DataUpdateCoordinator):
             del data[const.ATTR_TAGS]
         res = self.store.async_create_schedule(data)
         if res:
-            self.async_assign_tags_to_schedule(res.schedule_id, tags)
+            self.async_assign_tags_to_schedule(res.schedule_id, tags or [])
             async_dispatcher_send(self.hass, const.EVENT_ITEM_CREATED, res)
 
     @callback
@@ -288,6 +284,9 @@ class SchedulerCoordinator(DataUpdateCoordinator):
         if schedule_id not in self.hass.data[const.DOMAIN]["schedules"]:
             return
         item = self.async_get_schedule(schedule_id)
+
+        if item is None:
+            raise ValueError(f"Schedule not found: {schedule_id}")
 
         if ATTR_NAME in data and item[ATTR_NAME] != data[ATTR_NAME]:
             data[ATTR_NAME] = data[ATTR_NAME].strip()
@@ -303,7 +302,7 @@ class SchedulerCoordinator(DataUpdateCoordinator):
 
         entry = self.store.async_update_schedule(schedule_id, data)
         if tags_updated:
-            self.async_assign_tags_to_schedule(schedule_id, tags)
+            self.async_assign_tags_to_schedule(schedule_id, tags or [])
         entity = self.hass.data[const.DOMAIN]["schedules"][schedule_id]
         if ATTR_NAME in data:
             # if the name has been changed, the entity ID must change hence the entity should be destroyed
@@ -322,13 +321,9 @@ class SchedulerCoordinator(DataUpdateCoordinator):
         entity_registry = get_entity_registry(self.hass)
         entity_registry.async_remove(entity.entity_id)
         self.store.async_delete_schedule(schedule_id)
-        self.async_assign_tags_to_schedule(schedule_id, None)
+        self.async_assign_tags_to_schedule(schedule_id, [])
         self.hass.data[const.DOMAIN]["schedules"].pop(schedule_id, None)
         async_dispatcher_send(self.hass, const.EVENT_ITEM_REMOVED, schedule_id)
-
-    async def _async_update_data(self):
-        """Update data via library."""
-        return True
 
     async def async_unload(self):
         if self._workday_tracker:

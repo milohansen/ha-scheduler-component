@@ -16,13 +16,13 @@ from homeassistant.const import (
     CONF_CONDITIONS,
     CONF_ATTRIBUTE,
     CONF_STATE,
-    CONF_ACTION
+    CONF_ACTION,
 )
-from homeassistant.components.climate import (
+from homeassistant.components.climate.const import (
     SERVICE_SET_TEMPERATURE,
     SERVICE_SET_HVAC_MODE,
+    ATTR_CURRENT_TEMPERATURE,
     ATTR_HVAC_MODE,
-    ATTR_TEMPERATURE,
     ATTR_TARGET_TEMP_LOW,
     ATTR_TARGET_TEMP_HIGH,
     DOMAIN as CLIMATE_DOMAIN,
@@ -50,7 +50,9 @@ def parse_service_call(data: dict):
     """turn action data into a service call"""
 
     service_call = {
-        CONF_ACTION: data[CONF_ACTION] if CONF_ACTION in data else data[CONF_SERVICE], # map service->action for backwards compaibility
+        CONF_ACTION: (
+            data[CONF_ACTION] if CONF_ACTION in data else data[CONF_SERVICE]
+        ),  # map service->action for backwards compaibility
         CONF_SERVICE_DATA: data[ATTR_SERVICE_DATA],
     }
     if ATTR_ENTITY_ID in data and data[ATTR_ENTITY_ID]:
@@ -75,29 +77,33 @@ def parse_service_call(data: dict):
             }
         ]
         if (
-            ATTR_TEMPERATURE in service_call[CONF_SERVICE_DATA]
+            ATTR_CURRENT_TEMPERATURE in service_call[CONF_SERVICE_DATA]
             or ATTR_TARGET_TEMP_LOW in service_call[CONF_SERVICE_DATA]
             or ATTR_TARGET_TEMP_HIGH in service_call[CONF_SERVICE_DATA]
         ):
-            _service_call.extend([
-                {
-                    CONF_ACTION: ACTION_WAIT_STATE_CHANGE,
-                    ATTR_ENTITY_ID: service_call[ATTR_ENTITY_ID],
-                    CONF_SERVICE_DATA: {
-                        CONF_DELAY: 50,
-                        CONF_STATE: service_call[CONF_SERVICE_DATA][ATTR_HVAC_MODE]
+            _service_call.extend(
+                [
+                    {
+                        CONF_ACTION: ACTION_WAIT_STATE_CHANGE,
+                        ATTR_ENTITY_ID: service_call[ATTR_ENTITY_ID],
+                        CONF_SERVICE_DATA: {
+                            CONF_DELAY: 50,
+                            CONF_STATE: service_call[CONF_SERVICE_DATA][ATTR_HVAC_MODE],
+                        },
                     },
-                },
-                {
-                    CONF_ACTION: "{}.{}".format(CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE),
-                    ATTR_ENTITY_ID: service_call[ATTR_ENTITY_ID],
-                    CONF_SERVICE_DATA: {
-                        x: service_call[CONF_SERVICE_DATA][x]
-                        for x in service_call[CONF_SERVICE_DATA]
-                        if x != ATTR_HVAC_MODE
+                    {
+                        CONF_ACTION: "{}.{}".format(
+                            CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE
+                        ),
+                        ATTR_ENTITY_ID: service_call[ATTR_ENTITY_ID],
+                        CONF_SERVICE_DATA: {
+                            x: service_call[CONF_SERVICE_DATA][x]
+                            for x in service_call[CONF_SERVICE_DATA]
+                            if x != ATTR_HVAC_MODE
+                        },
                     },
-                },
-            ])
+                ]
+            )
         return _service_call
     else:
         return [service_call]
@@ -146,25 +152,21 @@ def validate_condition(hass: HomeAssistant, condition: dict, *args):
     if len(args):
         actual = args[0]
 
-    if (
-        condition[const.ATTR_MATCH_TYPE]
-        in [
-            const.MATCH_TYPE_BELOW,
-            const.MATCH_TYPE_ABOVE,
-        ]
-        and isinstance(required, str)
-    ):
+    if condition[const.ATTR_MATCH_TYPE] in [
+        const.MATCH_TYPE_BELOW,
+        const.MATCH_TYPE_ABOVE,
+    ] and isinstance(required, str):
         # parse condition as numeric if should be smaller or larger than X
         required = float(required)
 
     if isinstance(required, int):
         try:
-            actual = int(float(actual))
+            actual = int(float(actual)) # type: ignore
         except (ValueError, TypeError):
             return False
     elif isinstance(required, float):
         try:
-            actual = float(actual)
+            actual = float(actual) # type: ignore
         except (ValueError, TypeError):
             return False
     elif isinstance(required, str):
@@ -176,9 +178,9 @@ def validate_condition(hass: HomeAssistant, condition: dict, *args):
     elif condition[const.ATTR_MATCH_TYPE] == const.MATCH_TYPE_UNEQUAL:
         result = actual != required
     elif condition[const.ATTR_MATCH_TYPE] == const.MATCH_TYPE_BELOW:
-        result = actual < required
+        result = actual < required # type: ignore
     elif condition[const.ATTR_MATCH_TYPE] == const.MATCH_TYPE_ABOVE:
-        result = actual > required
+        result = actual > required # type: ignore
     else:
         result = False
 
@@ -209,9 +211,9 @@ def action_has_effect(action: dict, hass: HomeAssistant):
             and action[CONF_SERVICE_DATA][ATTR_HVAC_MODE] != current_state
         ):
             return True
-        if ATTR_TEMPERATURE in action[CONF_SERVICE_DATA] and float(
-            state.attributes.get(ATTR_TEMPERATURE, 0) or 0
-        ) != float(action[CONF_SERVICE_DATA].get(ATTR_TEMPERATURE)):
+        if ATTR_CURRENT_TEMPERATURE in action[CONF_SERVICE_DATA] and float(
+            state.attributes.get(ATTR_CURRENT_TEMPERATURE, 0) or 0
+        ) != float(action[CONF_SERVICE_DATA].get(ATTR_CURRENT_TEMPERATURE)):
             return True
         if ATTR_TARGET_TEMP_LOW in action[CONF_SERVICE_DATA] and float(
             state.attributes.get(ATTR_TARGET_TEMP_LOW, 0) or 0
@@ -238,7 +240,9 @@ class ActionHandler:
             self.hass, "action_queue_finished", self.async_cleanup_queues
         )
 
-    async def async_queue_actions(self, data: ScheduleEntry, skip_initial_execution = False):
+    async def async_queue_actions(
+        self, data: ScheduleEntry, skip_initial_execution=False
+    ):
         """add new actions to queue"""
         await self.async_empty_queue()
 
@@ -261,7 +265,7 @@ class ActionHandler:
         for queue in self._queues.copy().values():
             await queue.async_start(skip_initial_execution)
 
-    async def async_cleanup_queues(self, id: str = None):
+    async def async_cleanup_queues(self, id: str | None = None):
         """remove all objects from queue which have no remaining tasks"""
         if id is not None and id != self.id or not len(self._queues.keys()):
             return
@@ -360,8 +364,12 @@ class ActionQueue:
         async def async_entity_changed(event):
             """check if actions can be processed"""
             entity = event.data["entity_id"]
-            old_state = event.data["old_state"].state if event.data["old_state"] else None
-            new_state = event.data["new_state"].state if event.data["new_state"] else None
+            old_state = (
+                event.data["old_state"].state if event.data["old_state"] else None
+            )
+            new_state = (
+                event.data["new_state"].state if event.data["new_state"] else None
+            )
 
             if old_state == new_state:
                 # no change
@@ -381,11 +389,16 @@ class ActionQueue:
                 and old_state not in [STATE_UNAVAILABLE, STATE_UNKNOWN]
                 and new_state not in [STATE_UNAVAILABLE, STATE_UNKNOWN]
             ):
-                conditions = list(filter(lambda e: e[ATTR_ENTITY_ID] == entity, self._conditions))
-                if all([
-                    validate_condition(self.hass, item, old_state) == validate_condition(self.hass, item, new_state)
-                    for item in conditions
-                ]):
+                conditions = list(
+                    filter(lambda e: e[ATTR_ENTITY_ID] == entity, self._conditions)
+                )
+                if all(
+                    [
+                        validate_condition(self.hass, item, old_state)
+                        == validate_condition(self.hass, item, new_state)
+                        for item in conditions
+                    ]
+                ):
                     # ignore if state change has no effect on condition rules
                     return
 
@@ -403,7 +416,6 @@ class ActionQueue:
                     self.hass, watched_entities, async_entity_changed
                 )
             )
-
 
         if not skip_initial_execution:
             await self.async_process_queue()
@@ -517,13 +529,24 @@ class ActionQueue:
             task = self._queue[task_idx]
 
             if task[CONF_ACTION] in [ACTION_WAIT, ACTION_WAIT_STATE_CHANGE]:
-                if skip_action:
+                if skip_task:
                     task_idx = task_idx + 1
                     continue
                 elif task[CONF_ACTION] == ACTION_WAIT_STATE_CHANGE:
                     state = self.hass.states.get(task[ATTR_ENTITY_ID])
+                    if state is None:
+                        _LOGGER.debug(
+                            "[{}]: Entity {} is not available, cannot wait for state change, skipping task".format(
+                                self.id, task[ATTR_ENTITY_ID]
+                            )
+                        )
+                        skip_task = True
+                        task_idx = task_idx + 1
+                        continue
                     if CONF_ATTRIBUTE in task[CONF_SERVICE_DATA]:
-                        state = state.attributes.get(task[CONF_SERVICE_DATA][CONF_ATTRIBUTE])
+                        state = state.attributes.get(
+                            task[CONF_SERVICE_DATA][CONF_ATTRIBUTE]
+                        )
                     else:
                         state = state.state
                     if state == task[CONF_SERVICE_DATA][CONF_STATE]:
@@ -538,7 +561,7 @@ class ActionQueue:
                         continue
 
                 @callback
-                async def async_timer_finished(_now):
+                async def async_timer_finished(_now) -> None:
                     self._timer = None
                     if self._state_update_listener:
                         self._state_update_listener()
@@ -558,14 +581,18 @@ class ActionQueue:
                 )
 
                 @callback
-                async def async_entity_changed(event):
+                async def async_entity_changed(event) -> None:
                     entity = event.data["entity_id"]
                     old_state = event.data["old_state"]
                     new_state = event.data["new_state"]
 
                     if CONF_ATTRIBUTE in task[CONF_SERVICE_DATA]:
-                        old_state = old_state.attributes.get(task[CONF_SERVICE_DATA][CONF_ATTRIBUTE])
-                        new_state = new_state.attributes.get(task[CONF_SERVICE_DATA][CONF_ATTRIBUTE])
+                        old_state = old_state.attributes.get(
+                            task[CONF_SERVICE_DATA][CONF_ATTRIBUTE]
+                        )
+                        new_state = new_state.attributes.get(
+                            task[CONF_SERVICE_DATA][CONF_ATTRIBUTE]
+                        )
                     else:
                         old_state = old_state.state
                         new_state = new_state.state
@@ -573,10 +600,7 @@ class ActionQueue:
                         return
                     _LOGGER.debug(
                         "[{}]: Entity {} was updated from {} to {}".format(
-                            self.id,
-                            entity,
-                            old_state,
-                            new_state
+                            self.id, entity, old_state, new_state
                         )
                     )
                     if new_state == task[CONF_SERVICE_DATA][CONF_STATE]:
@@ -584,7 +608,8 @@ class ActionQueue:
                         if self._timer:
                             self._timer()
                         self._timer = None
-                        self._state_update_listener()
+                        if self._state_update_listener is not None:
+                            self._state_update_listener()
                         self._state_update_listener = None
                         self.queue_busy = False
                         await self.async_process_queue(task_idx + 1)

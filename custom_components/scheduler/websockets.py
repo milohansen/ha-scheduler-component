@@ -3,7 +3,7 @@ import logging
 import voluptuous as vol
 from homeassistant.helpers import config_validation as cv
 from homeassistant.components import websocket_api
-from homeassistant.components.http import HomeAssistantView
+from homeassistant.helpers.http import HomeAssistantView
 from homeassistant.components.http.data_validator import RequestDataValidator
 from homeassistant.core import callback
 from homeassistant.components.websocket_api import decorators, async_register_command
@@ -236,7 +236,7 @@ async def async_register_websockets(hass):
         hass,
         const.DOMAIN,
         websocket_get_schedules,
-        websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend(
+        vol.Schema(
             {
                 vol.Required("type"): const.DOMAIN,
             }
@@ -248,7 +248,7 @@ async def async_register_websockets(hass):
         hass,
         "{}/item".format(const.DOMAIN),
         websocket_get_schedule_item,
-        websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend(
+        vol.Schema(
             {
                 vol.Required("type"): "{}/item".format(const.DOMAIN),
                 vol.Required(const.ATTR_SCHEDULE_ID): cv.string,
@@ -261,7 +261,7 @@ async def async_register_websockets(hass):
         hass,
         "{}/tags".format(const.DOMAIN),
         websocket_get_tags,
-        websocket_api.BASE_COMMAND_MESSAGE_SCHEMA.extend(
+        vol.Schema(
             {
                 vol.Required("type"): "{}/tags".format(const.DOMAIN),
             }

@@ -42,6 +42,8 @@ def is_same_day(dateA: datetime.datetime, dateB: datetime.datetime):
 
 def days_until_date(date_string: str, ts: datetime.datetime):
     date = dt_util.parse_date(date_string)
+    if date is None:
+        raise ValueError(f"invalid date string: {date_string}")
     diff = date - ts.date()
     return diff.days
 
@@ -76,7 +78,7 @@ class TimerHandler:
         self._next_slot = None
         self._sun_tracker = None
         self._workday_tracker = None
-        self._watched_times = []
+        self._watched_times: list[str] = []
 
         self.slot_queue = []
         self.timestamps = []
@@ -98,6 +100,9 @@ class TimerHandler:
         store = await async_get_registry(self.hass)
         data = store.async_get_schedule(self.id)
 
+        if data is None:
+            return
+
         self._weekdays = data[const.ATTR_WEEKDAYS]
         self._start_date = data[const.ATTR_START_DATE]
         self._end_date = data[const.ATTR_END_DATE]
@@ -118,9 +123,9 @@ class TimerHandler:
         [next_slot, timestamp_next] = self.next_timeslot()
 
         self._watched_times = []
-        if timestamp_next is not None:
+        if timestamp_next is not None and next_slot is not None:
             self._watched_times.append(self._timeslots[next_slot][const.ATTR_START])
-        if timestamp_end is not None:
+        if timestamp_end is not None and current_slot is not None:
             self._watched_times.append(self._timeslots[current_slot][const.ATTR_STOP])
 
         # the next trigger time is next slot or end of current slot (whichever comes first)
@@ -184,7 +189,7 @@ class TimerHandler:
                 return
 
             @callback
-            async def async_sun_updated(_event):
+            async def async_sun_updated(_event) -> None:
                 """the sun entity was updated"""
                 # sun entity changed
                 if self._next_trigger is None:
@@ -192,7 +197,7 @@ class TimerHandler:
                     await self.async_start_timer()
                     return
                 ts = find_closest_from_now(
-                    self.calculate_timestamp(x) for x in self._watched_times
+                    [self.calculate_timestamp(x) for x in self._watched_times]
                 )
                 if not ts or not self._next_trigger:
                     # sun entity became unavailable (or other corner case)
@@ -316,11 +321,11 @@ class TimerHandler:
 
     def calculate_timestamp(
         self,
-        time_str,
-        now: datetime.datetime = None,
+        time_str: str,
+        now: datetime.datetime | None = None,
         iteration: int = 0,
         reverse_direction: bool = False,
-    ) -> datetime.datetime:
+    ) -> datetime.datetime | None:
         """calculate the next occurence of a time string"""
         if time_str is None:
             return None
@@ -331,6 +336,8 @@ class TimerHandler:
         if not res:
             # fixed time
             time = dt_util.parse_time(time_str)
+            if time is None:
+                raise ValueError(f"invalid time string: {time_str}")
             ts = dt_util.find_next_time_expression_time(
                 now, [time.second], [time.minute], [time.hour]
             )
@@ -358,6 +365,8 @@ class TimerHandler:
                 hours=ts.hour, minutes=ts.minute, seconds=ts.second
             )
             offset = dt_util.parse_time(res.group(3))
+            if offset is None:
+                raise ValueError(f"invalid time string: {res.group(3)}")
             offset = datetime.timedelta(
                 hours=offset.hour, minutes=offset.minute, seconds=offset.second
             )
@@ -445,7 +454,7 @@ class TimerHandler:
 
         return (next_slot, timestamps[next_slot] if next_slot is not None else None)
 
-    def current_timeslot(self, now: datetime.datetime = None):
+    def current_timeslot(self, now: datetime.datetime | None = None):
         """calculate the end of the timeslot that is overlapping now"""
         if now is None:
             now = dt_util.as_local(dt_util.utcnow())

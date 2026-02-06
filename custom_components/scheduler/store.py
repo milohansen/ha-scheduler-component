@@ -2,8 +2,8 @@ import logging
 import secrets
 from collections import OrderedDict
 from typing import MutableMapping, cast
+from dataclasses import dataclass, field, asdict, replace
 
-import attr
 from homeassistant.core import callback, HomeAssistant
 from homeassistant.loader import bind_hass
 from homeassistant.const import (
@@ -21,57 +21,59 @@ STORAGE_VERSION = 3
 SAVE_DELAY = 10
 
 
-@attr.s(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ActionEntry:
     """Action storage Entry."""
 
-    service = attr.ib(type=str, default="")
-    entity_id = attr.ib(type=str, default=None)
-    service_data = attr.ib(type=dict, default={})
+    service: str = ""
+    entity_id: str | None = None
+    service_data: dict = field(default_factory=dict)
 
 
-@attr.s(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ConditionEntry:
     """Condition storage Entry."""
 
-    entity_id = attr.ib(type=str, default=None)
-    attribute = attr.ib(type=str, default=None)
-    value = attr.ib(type=str, default=None)
-    match_type = attr.ib(type=str, default=None)
+    entity_id: str | None = None
+    attribute: str | None = None
+    value: str | None = None
+    match_type: str | None = None
 
-
-@attr.s(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class TimeslotEntry:
     """Timeslot storage Entry."""
 
-    start = attr.ib(type=str, default=None)
-    stop = attr.ib(type=str, default=None)
-    conditions = attr.ib(type=[ConditionEntry], default=[])
-    condition_type = attr.ib(type=str, default=None)
-    track_conditions = attr.ib(type=bool, default=False)
-    actions = attr.ib(type=[ActionEntry], default=[])
+    start: str | None = None
+    stop: str | None = None
+    conditions: list = field(default_factory=list)
+    condition_type: str | None = None
+    track_conditions: bool = False
+    actions: list = field(default_factory=list)
 
 
-@attr.s(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ScheduleEntry:
     """Schedule storage Entry."""
 
-    schedule_id = attr.ib(type=str, default=None)
-    weekdays = attr.ib(type=list, default=[])
-    start_date = attr.ib(type=str, default=None)
-    end_date = attr.ib(type=str, default=None)
-    timeslots = attr.ib(type=[TimeslotEntry], default=[])
-    repeat_type = attr.ib(type=str, default=None)
-    name = attr.ib(type=str, default=None)
-    enabled = attr.ib(type=bool, default=True)
+    schedule_id: str
+    weekdays: list = field(default_factory=list)
+    start_date: str | None = None
+    end_date: str | None = None
+    timeslots: list = field(default_factory=list)
+    repeat_type: str | None = None
+    name: str | None = None
+    enabled: bool = True
+
+    def __getitem__(self, item):
+        return getattr(self, item)
 
 
-@attr.s(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class TagEntry:
     """Tag storage Entry."""
 
-    name = attr.ib(type=str, default=None)
-    schedules = attr.ib(type=[str], default=[])
+    name: str | None = None
+    schedules: list = field(default_factory=list)
 
 
 def parse_schedule_data(data: dict):
@@ -83,65 +85,16 @@ def parse_schedule_data(data: dict):
                 conditions = []
                 for condition in item[CONF_CONDITIONS]:
                     conditions.append(ConditionEntry(**condition))
-                timeslot = attr.evolve(timeslot, **{CONF_CONDITIONS: conditions})
+                timeslot = replace(timeslot, **{CONF_CONDITIONS: conditions})
             if const.ATTR_ACTIONS in item and item[const.ATTR_ACTIONS]:
                 actions = []
                 for action in item[const.ATTR_ACTIONS]:
                     actions.append(ActionEntry(**action))
-                timeslot = attr.evolve(timeslot, **{const.ATTR_ACTIONS: actions})
+                timeslot = replace(timeslot, **{const.ATTR_ACTIONS: actions})
             timeslots.append(timeslot)
         data[const.ATTR_TIMESLOTS] = timeslots
     return data
 
-
-class MigratableStore(Store):
-    async def _async_migrate_func(self, old_version, data: dict):
-
-        def remove_unequal_number_conditions(timeslots):
-            """ensure all timeslots have the same number of conditions"""
-            if len(timeslots) > 1 and not all(
-                len(el["conditions"]) == len(timeslots[0]["conditions"])
-                for el in timeslots
-            ):
-                return [
-                    {
-                        **slot,
-                        "conditions": timeslots[0]["conditions"]
-                    }
-                    for slot in timeslots
-                ]
-            return timeslots
-
-        if old_version < 2:
-            data["schedules"] = (
-                [
-                    {
-                        **entry,
-                        const.ATTR_START_DATE: entry[const.ATTR_START_DATE]
-                        if const.ATTR_START_DATE in entry
-                        else None,
-                        const.ATTR_END_DATE: entry[const.ATTR_END_DATE]
-                        if const.ATTR_END_DATE in entry
-                        else None,
-                    }
-                    for entry in data["schedules"]
-                ]
-                if "schedules" in data
-                else []
-            )
-        if old_version < 3:
-            data["schedules"] = (
-                [
-                    {
-                        **entry,
-                        const.ATTR_TIMESLOTS: remove_unequal_number_conditions(entry[const.ATTR_TIMESLOTS])
-                    }
-                    for entry in data["schedules"]
-                ]
-                if "schedules" in data
-                else []
-            )
-        return data
 
 
 class ScheduleStorage:
@@ -152,8 +105,8 @@ class ScheduleStorage:
         self.hass = hass
         self.schedules: MutableMapping[str, ScheduleEntry] = {}
         self.tags: MutableMapping[str, TagEntry] = {}
-        self.time_shutdown = None
-        self._store = MigratableStore(hass, STORAGE_VERSION, STORAGE_KEY)
+        self.time_shutdown: str | None = None
+        self._store = Store(hass, 0, STORAGE_KEY, atomic_writes=True)
 
     async def async_load(self) -> None:
         """Load the registry of schedule entries."""
@@ -229,14 +182,14 @@ class ScheduleStorage:
                 }
                 if slot.conditions:
                     for condition in slot.conditions:
-                        timeslot[CONF_CONDITIONS].append(attr.asdict(condition))
+                        timeslot[CONF_CONDITIONS].append(asdict(condition))
                 if slot.actions:
                     for action in slot.actions:
-                        timeslot[const.ATTR_ACTIONS].append(attr.asdict(action))
+                        timeslot[const.ATTR_ACTIONS].append(asdict(action))
                 item[const.ATTR_TIMESLOTS].append(timeslot)
             store_data["schedules"].append(item)
 
-        store_data["tags"] = [attr.asdict(entry) for entry in self.tags.values()]
+        store_data["tags"] = [asdict(entry) for entry in self.tags.values()]
 
         if self.time_shutdown:
             store_data["time_shutdown"] = self.time_shutdown
@@ -251,27 +204,27 @@ class ScheduleStorage:
         await self._store.async_remove()
 
     @callback
-    def async_get_schedule(self, entity_id) -> dict:
+    def async_get_schedule(self, entity_id) -> ScheduleEntry | None:
         """Get an existing ScheduleEntry by id."""
         res = self.schedules.get(entity_id)
-        return attr.asdict(res) if res else None
+        return res if res else None
 
     @callback
     def async_get_schedules(self) -> dict:
         """Get an existing ScheduleEntry by id."""
         res = {}
         for (key, val) in self.schedules.items():
-            res[key] = attr.asdict(val)
+            res[key] = asdict(val)
         return res
 
     @callback
-    def async_create_schedule(self, data: dict) -> ScheduleEntry:
+    def async_create_schedule(self, data: dict) -> ScheduleEntry | None:
         """Create a new ScheduleEntry."""
         if const.ATTR_SCHEDULE_ID in data:
             schedule_id = data[const.ATTR_SCHEDULE_ID]
             del data[const.ATTR_SCHEDULE_ID]
             if schedule_id in self.schedules:
-                return
+                return None
         else:
             schedule_id = secrets.token_hex(3)
             while schedule_id in self.schedules:
@@ -284,7 +237,7 @@ class ScheduleStorage:
         return new_schedule
 
     @callback
-    def async_delete_schedule(self, schedule_id: str) -> None:
+    def async_delete_schedule(self, schedule_id: str) -> bool:
         """Delete ScheduleEntry."""
         if schedule_id in self.schedules:
             del self.schedules[schedule_id]
@@ -297,26 +250,26 @@ class ScheduleStorage:
         """Update existing ScheduleEntry."""
         old = self.schedules[schedule_id]
         changes = parse_schedule_data(changes)
-        new = self.schedules[schedule_id] = attr.evolve(old, **changes)
+        new = self.schedules[schedule_id] = replace(old, **changes)
         self.async_schedule_save()
         return new
 
     @callback
-    def async_get_tag(self, name: str) -> dict:
+    def async_get_tag(self, name: str) -> dict | None:
         """Get an existing TagEntry by id."""
         res = self.tags.get(name)
-        return attr.asdict(res) if res else None
+        return asdict(res) if res else None
 
     @callback
     def async_get_tags(self) -> dict:
         """Get an existing TagEntry by id."""
         res = {}
         for (key, val) in self.tags.items():
-            res[key] = attr.asdict(val)
+            res[key] = asdict(val)
         return res
 
     @callback
-    def async_create_tag(self, data: dict) -> TagEntry:
+    def async_create_tag(self, data: dict) -> TagEntry | None:
         """Create a new TagEntry."""
         name = data[ATTR_NAME] if ATTR_NAME in data else None
         if not name or name in data:
@@ -328,7 +281,7 @@ class ScheduleStorage:
         return new_tag
 
     @callback
-    def async_delete_tag(self, name: str) -> None:
+    def async_delete_tag(self, name: str) -> bool:
         """Delete TagEntry."""
         if name in self.tags:
             del self.tags[name]
@@ -341,12 +294,12 @@ class ScheduleStorage:
         """Update existing TagEntry."""
         old = self.tags[name]
         changes = parse_schedule_data(changes)
-        new = self.tags[name] = attr.evolve(old, **changes)
+        new = self.tags[name] = replace(old, **changes)
         self.async_schedule_save()
         return new
 
     @callback
-    def async_get_time_shutdown(self) -> dict:
+    def async_get_time_shutdown(self) -> str | None:
         """Get the shutdown time and clear the stored value afterwards."""
         res = self.time_shutdown
         self.time_shutdown = None
