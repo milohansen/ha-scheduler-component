@@ -1,6 +1,7 @@
 """Domain-specific action handlers for the scheduler component."""
+
 import logging
-from typing import Protocol, Callable
+from typing import Protocol
 
 from homeassistant.core import HomeAssistant
 from homeassistant.const import (
@@ -39,7 +40,7 @@ class DomainHandler(Protocol):
 
 class ClimateDomainHandler:
     """Handler for climate domain actions.
-    
+
     Handles the special case where climate integrations don't support
     setting hvac_mode and temperature together. Splits the service call
     into multiple steps with state change waiting.
@@ -55,7 +56,7 @@ class ClimateDomainHandler:
 
     def process(self, action: dict, hass: HomeAssistant) -> list[dict]:
         """Split climate service call into mode change, wait, and temperature set.
-        
+
         This fixes climate integrations which:
         - Don't support setting hvac_mode and temperature together
         - Have long processing time requiring delay between calls
@@ -132,7 +133,7 @@ class DomainHandlerRegistry:
 
     def register(self, handler: DomainHandler) -> None:
         """Register a domain handler.
-        
+
         Handlers are checked in registration order, so register more
         specific handlers before generic ones.
         """
@@ -141,7 +142,7 @@ class DomainHandlerRegistry:
 
     def process_action(self, action: dict, hass: HomeAssistant) -> list[dict]:
         """Process an action through registered handlers.
-        
+
         Returns a list of service calls to execute. Most actions return
         a single-item list, but some handlers may split actions into
         multiple service calls.

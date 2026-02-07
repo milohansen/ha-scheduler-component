@@ -9,6 +9,8 @@ import homeassistant.util.dt as dt_util
 import voluptuous as vol
 from homeassistant.components.switch.const import DOMAIN as PLATFORM
 from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_PLATFORM
+from homeassistant.components.timer import DOMAIN as TIMER_PLATFORM
+from homeassistant.components.calendar.const import DOMAIN as CALENDAR_PLATFORM
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -68,7 +70,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         hass.config_entries.async_update_entry(entry, unique_id=coordinator.id)
 
     await hass.config_entries.async_forward_entry_setups(
-        entry, [PLATFORM, BINARY_SENSOR_PLATFORM]
+        entry, [PLATFORM, BINARY_SENSOR_PLATFORM, TIMER_PLATFORM, CALENDAR_PLATFORM]
     )
 
     await async_register_websockets(hass)
@@ -222,7 +224,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
             if data is None:
                 raise vol.Invalid(f"Schedule not found: {match}")
-            
+
             data = asdict(data)
 
             tags = coordinator.async_get_tags_for_schedule(data[const.ATTR_SCHEDULE_ID])
@@ -271,6 +273,10 @@ async def async_unload_entry(hass, entry):
                 hass.config_entries.async_forward_entry_unload(
                     entry, BINARY_SENSOR_PLATFORM
                 ),
+                hass.config_entries.async_forward_entry_unload(entry, TIMER_PLATFORM),
+                hass.config_entries.async_forward_entry_unload(
+                    entry, CALENDAR_PLATFORM
+                ),
             ]
         )
     )
@@ -284,6 +290,30 @@ async def async_remove_entry(hass, entry):
     coordinator = hass.data[const.DOMAIN]["coordinator"]
     await coordinator.async_delete_config()
     del hass.data[const.DOMAIN]
+
+
+async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigEntry):
+    """Return diagnostics for a config entry."""
+    store = await async_get_registry(hass)
+    schedules = []
+    for schedule in store.schedules.values():
+        schedules.append(
+            {
+                "schedule_id": schedule.schedule_id,
+                "name": schedule.name,
+                "timer_type": schedule.timer_type,
+                "last_error": schedule.last_error,
+                "execution_count": schedule.execution_count,
+                "failure_count": schedule.failure_count,
+                "calendar_entities": schedule.calendar_entities,
+                "calendar_match": schedule.calendar_match,
+            }
+        )
+    return {
+        "version": const.VERSION,
+        "schedule_count": len(store.schedules),
+        "schedules": schedules,
+    }
 
 
 class SchedulerCoordinator(DataUpdateCoordinator):

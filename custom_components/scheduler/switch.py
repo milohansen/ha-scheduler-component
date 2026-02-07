@@ -35,13 +35,12 @@ from homeassistant.helpers.event import (
 from homeassistant.util import slugify
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
-    async_dispatcher_send,
 )
-from homeassistant.components.persistent_notification import async_create as async_create_notification
+
+from custom_components.scheduler.timer import TimerHandler
 from . import const
-from .store import ScheduleEntry, async_get_registry
-from .timer import TimerHandler, CountdownTimerHandler
-from .actions import ActionHandler
+from .store import ScheduleEntry
+from .base_entity import BaseScheduleEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,11 +53,6 @@ RUN_ACTION_SCHEMA = cv.make_entity_service_schema(
         vol.Optional(const.ATTR_SKIP_CONDITIONS): cv.boolean,
     }
 )
-
-
-def entity_exists_in_hass(hass, entity_id):
-    """Check that an entity exists."""
-    return hass.states.get(entity_id) is not None
 
 
 def date_in_future(date_string: str):
@@ -89,6 +83,9 @@ async def async_setup_entry(hass, _config_entry, async_add_entities):
     def async_add_entity(schedule: ScheduleEntry):
         """Add switch for Scheduler."""
 
+        if schedule.timer_type == const.TIMER_TYPE_TRANSIENT:
+            return
+
         schedule_id = schedule.schedule_id
         name = schedule.name
 
@@ -112,19 +109,18 @@ async def async_setup_entry(hass, _config_entry, async_add_entities):
             SERVICE_RUN_ACTION, RUN_ACTION_SCHEMA, "async_service_run_action"
         )
     else:
-        _LOGGER.error(f"Couldn't register service {SERVICE_RUN_ACTION}, platform not found")
+        _LOGGER.error(
+            f"Couldn't register service {SERVICE_RUN_ACTION}, platform not found"
+        )
 
 
-class ScheduleEntity(ToggleEntity):
+class ScheduleEntity(BaseScheduleEntity, ToggleEntity):
     """Defines a base schedule entity."""
 
     def __init__(self, coordinator, hass, schedule_id: str, entity_id: str) -> None:
         """Initialize the schedule entity."""
-        self.coordinator = coordinator
-        self.hass = hass
-        self.schedule_id = schedule_id
+        BaseScheduleEntity.__init__(self, coordinator, hass, schedule_id)
         self.entity_id = entity_id
-        self.schedule = None
 
         self._state = None
         self._timer = None
@@ -146,37 +142,13 @@ class ScheduleEntity(ToggleEntity):
             ),
         ]
 
-    def _create_timer_handler(self):
-        """Create a timer handler based on schedule type."""
-        if self.schedule and self.schedule.timer_type == const.TIMER_TYPE_TRANSIENT:
-            return CountdownTimerHandler(self.hass, self.schedule_id)
-        return TimerHandler(self.hass, self.schedule_id)
-
     @callback
     async def async_item_updated(self, id: str):
         """update internal properties when schedule config was changed"""
         if id != self.schedule_id:
             return
 
-        store = await async_get_registry(self.hass)
-        self.schedule = store.async_get_schedule(self.schedule_id)
-        self._tags = self.coordinator.async_get_tags_for_schedule(self.schedule_id)
-
-        if self.schedule is None:
-            raise ValueError(f"Schedule with id {self.schedule_id} not found in store")
-
-        # Create or recreate timer handler if type changed
-        if not hasattr(self, "_timer_handler") or self._timer_handler is None:
-            self._timer_handler = self._create_timer_handler()
-        else:
-            expected_handler = (
-                CountdownTimerHandler
-                if self.schedule.timer_type == const.TIMER_TYPE_TRANSIENT
-                else TimerHandler
-            )
-            if not isinstance(self._timer_handler, expected_handler):
-                await self._timer_handler.async_unload()
-                self._timer_handler = self._create_timer_handler()
+        await self.async_load_schedule()
 
         if self.schedule[const.ATTR_ENABLED] and self._state in [
             STATE_OFF,
@@ -251,7 +223,13 @@ class ScheduleEntity(ToggleEntity):
                 self._state = STATE_UNAVAILABLE
             else:
                 now = dt_util.as_local(dt_util.utcnow())
-                if ((self._timer_handler._next_trigger or now) - now).total_seconds() < 0:
+                if (
+                    isinstance(self._timer_handler, TimerHandler)
+                    and (
+                        (self._timer_handler._next_trigger or now) - now
+                    ).total_seconds()
+                    < 0
+                ):
                     self._state = const.STATE_COMPLETED
                 else:
                     self._state = (
@@ -273,8 +251,10 @@ class ScheduleEntity(ToggleEntity):
                     start_time = self.schedule[const.ATTR_TIMESLOTS][
                         self._current_slot
                     ][const.ATTR_START]
-                    start_of_timeslot = self._timer_handler.calculate_timestamp(
-                        start_time, ts_shutdown
+                    start_of_timeslot = (
+                        self._timer_handler.calculate_timestamp(start_time, ts_shutdown)
+                        if isinstance(self._timer_handler, TimerHandler)
+                        else None
                     )
                     if start_of_timeslot is not None and start_of_timeslot > now:
                         skip_initial_execution = True
@@ -305,7 +285,10 @@ class ScheduleEntity(ToggleEntity):
         if id != self.schedule_id:
             return
 
-        if self._state not in [STATE_OFF, const.STATE_COMPLETED] and self.schedule is not None:
+        if (
+            self._state not in [STATE_OFF, const.STATE_COMPLETED]
+            and self.schedule is not None
+        ):
 
             self._current_slot = self._timer_handler.current_slot
             if self._current_slot is not None:
@@ -325,7 +308,10 @@ class ScheduleEntity(ToggleEntity):
                         f"Schedule {self.schedule_id} action execution failed: {err}"
                     )
 
-        if self.schedule is not None and self.schedule.timer_type == const.TIMER_TYPE_TRANSIENT:
+        if (
+            self.schedule is not None
+            and self.schedule.timer_type == const.TIMER_TYPE_TRANSIENT
+        ):
             self._state = const.STATE_COMPLETED
             self.async_write_ha_state()
             self.coordinator.async_delete_schedule(self.schedule_id)
@@ -353,49 +339,7 @@ class ScheduleEntity(ToggleEntity):
             self._timer()
             self._timer = None
 
-    async def _track_execution_success(self):
-        """Track successful action execution."""
-        from datetime import datetime, timezone
-        
-        store = await async_get_registry(self.hass)
-        now = datetime.now(timezone.utc).isoformat()
-        
-        updates = {
-            "last_run": now,
-            "last_error": None,
-            "execution_count": self.schedule.execution_count + 1,
-        }
-        
-        self.schedule = store.async_update_schedule(self.schedule_id, updates)
-        async_dispatcher_send(self.hass, const.EVENT_ITEM_UPDATED, self.schedule_id)
-        _LOGGER.debug(f"Schedule {self.schedule_id} executed successfully")
-
-    async def _track_execution_failure(self, error_message: str):
-        """Track failed action execution."""
-        from datetime import datetime, timezone
-        
-        store = await async_get_registry(self.hass)
-        now = datetime.now(timezone.utc).isoformat()
-        
-        updates = {
-            "last_run": now,
-            "last_error": error_message,
-            "execution_count": self.schedule.execution_count + 1,
-            "failure_count": self.schedule.failure_count + 1,
-        }
-        
-        self.schedule = store.async_update_schedule(self.schedule_id, updates)
-        async_dispatcher_send(self.hass, const.EVENT_ITEM_UPDATED, self.schedule_id)
-
-        async_create_notification(
-            self.hass,
-            f"Schedule '{self.schedule.name or self.schedule_id}' failed: {error_message}",
-            title="Scheduler Action Failed",
-            notification_id=f"scheduler_error_{self.schedule_id}",
-        )
-        _LOGGER.error(
-            f"Schedule {self.schedule_id} execution failed: {error_message}"
-        )
+    # _track_execution_success/_track_execution_failure now handled by BaseScheduleEntity
 
     @cached_property
     def device_info(self) -> DeviceInfo:
@@ -508,7 +452,7 @@ class ScheduleEntity(ToggleEntity):
             output["last_error"] = self.schedule.last_error
             output["execution_count"] = self.schedule.execution_count
             output["failure_count"] = self.schedule.failure_count
-            
+
             # Add error_info for UI/automation use
             if self.schedule.last_error:
                 output["error_info"] = {
@@ -549,18 +493,14 @@ class ScheduleEntity(ToggleEntity):
                 "name": self.schedule[ATTR_NAME] if self.schedule else "",
                 "entity_id": self.entity_id,
                 "tags": self.tags,
+                "entity_type": "switch",
             }
         )
         return data
 
     async def async_added_to_hass(self):
         """Connect to dispatcher listening for entity data notifications."""
-        store = await async_get_registry(self.hass)
-        self.schedule = store.async_get_schedule(self.schedule_id)
-        self._tags = self.coordinator.async_get_tags_for_schedule(self.schedule_id)
-
-        self._timer_handler = self._create_timer_handler()
-        self._action_handler = ActionHandler(self.hass, self.schedule_id)
+        await self.async_load_schedule()
 
     async def async_turn_off(self, **kwargs: Any):
         """turn off a schedule"""
@@ -636,7 +576,11 @@ class ScheduleEntity(ToggleEntity):
             )
             return
 
-        schedule = dict(self.schedule[const.ATTR_TIMESLOTS][slot] if self.schedule is not None else {})
+        schedule = dict(
+            self.schedule[const.ATTR_TIMESLOTS][slot]
+            if self.schedule is not None
+            else {}
+        )
         if skip_conditions:
             schedule[CONF_CONDITIONS] = []
 

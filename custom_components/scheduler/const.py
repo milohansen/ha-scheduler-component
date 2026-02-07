@@ -1,4 +1,5 @@
 """Store constants."""
+
 import logging
 import voluptuous as vol
 import re
@@ -79,6 +80,13 @@ ATTR_TAGS = "tags"
 ATTR_SCHEDULES = "schedules"
 ATTR_START_DATE = "start_date"
 ATTR_END_DATE = "end_date"
+ATTR_CALENDAR_ENTITIES = "calendar_entities"
+ATTR_CALENDAR_MATCH = "calendar_match"
+ATTR_CALENDAR_LOOKAHEAD = "calendar_lookahead_days"
+CALENDAR_LOOKAHEAD_DAYS = 30
+ATTR_AREA_ID = "area_id"
+ATTR_EXECUTION_HISTORY = "execution_history"
+EXECUTION_HISTORY_MAX = 100
 
 EVENT_TIMER_FINISHED = "scheduler_timer_finished"
 EVENT_TIMER_UPDATED = "scheduler_timer_updated"
@@ -141,6 +149,7 @@ CONDITION_SCHEMA = vol.Schema(
 ACTION_SCHEMA = vol.Schema(
     {
         vol.Optional(ATTR_ENTITY_ID): cv.entity_id,
+        vol.Optional(ATTR_AREA_ID): cv.string,
         vol.Required(ATTR_SERVICE): cv.entity_id,
         vol.Optional(ATTR_SERVICE_DATA): dict,
     }
@@ -201,6 +210,13 @@ ADD_SCHEDULE_SCHEMA = vol.Schema(
                 TIMER_TYPE_TRANSIENT,
             ]
         ),
+        vol.Optional(ATTR_CALENDAR_ENTITIES): vol.All(
+            cv.ensure_list, vol.Unique(), [cv.entity_id]
+        ),
+        vol.Optional(ATTR_CALENDAR_MATCH): cv.string,
+        vol.Optional(ATTR_CALENDAR_LOOKAHEAD): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=365)
+        ),
         vol.Optional(ATTR_NAME): vol.Any(cv.string, None),
         vol.Optional(ATTR_TAGS): vol.All(cv.ensure_list, vol.Unique(), [cv.string]),
     }
@@ -241,6 +257,13 @@ EDIT_SCHEDULE_SCHEMA = vol.Schema(
                 TIMER_TYPE_TRANSIENT,
             ]
         ),
+        vol.Optional(ATTR_CALENDAR_ENTITIES): vol.All(
+            cv.ensure_list, vol.Unique(), [cv.entity_id]
+        ),
+        vol.Optional(ATTR_CALENDAR_MATCH): cv.string,
+        vol.Optional(ATTR_CALENDAR_LOOKAHEAD): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=365)
+        ),
         vol.Optional(ATTR_NAME): vol.Any(cv.string, None),
         vol.Optional(ATTR_TAGS): vol.All(cv.ensure_list, vol.Unique(), [cv.string]),
     }
@@ -260,7 +283,7 @@ RUN_IN_SCHEMA = vol.Schema(
 
 class SchedulerLogger:
     """Structured logging wrapper for scheduler component.
-    
+
     Provides context-aware logging with schedule_id tagging for easier
     debugging and troubleshooting.
     """
@@ -269,7 +292,9 @@ class SchedulerLogger:
         """Initialize the logger."""
         self._logger = logging.getLogger(name)
 
-    def _format_message(self, msg: str, schedule_id: str | None = None, **kwargs) -> str:
+    def _format_message(
+        self, msg: str, schedule_id: str | None = None, **kwargs
+    ) -> str:
         """Format message with schedule context."""
         if schedule_id:
             msg = f"[{schedule_id}] {msg}"
@@ -303,4 +328,3 @@ class SchedulerLogger:
 def get_logger(name: str) -> SchedulerLogger:
     """Get a structured logger for the scheduler component."""
     return SchedulerLogger(name)
-

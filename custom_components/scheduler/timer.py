@@ -12,6 +12,16 @@ from homeassistant.core import (
     HomeAssistant,
     callback,
 )
+from homeassistant.util import slugify
+from homeassistant.components.timer import (
+    ATTR_DURATION as TIMER_ATTR_DURATION,
+    ATTR_REMAINING as TIMER_ATTR_REMAINING,
+    ATTR_FINISHES_AT as TIMER_ATTR_FINISHES_AT,
+    STATUS_ACTIVE,
+    STATUS_IDLE,
+    STATUS_PAUSED,
+)
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.event import (
     async_track_point_in_time,
     async_track_state_change_event,
@@ -20,16 +30,45 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
 )
+from propcache import cached_property
 
 
 from . import const
 from .store import async_get_registry
+from .base_entity import BaseScheduleEntity
+from .calendar_helper import async_collect_events
 
 _LOGGER = logging.getLogger(__name__)
 
 ATTR_NEXT_RISING = "next_rising"
 ATTR_NEXT_SETTING = "next_setting"
 ATTR_WORKDAYS = "workdays"
+
+
+async def async_setup_entry(hass, _config_entry, async_add_entities):
+    """Set up Scheduler timer entities (transient schedules)."""
+    coordinator = hass.data[const.DOMAIN]["coordinator"]
+
+    @callback
+    def async_add_entity(schedule):
+        if schedule.timer_type != const.TIMER_TYPE_TRANSIENT:
+            return
+
+        name = schedule.name
+        schedule_id = schedule.schedule_id
+        if name:
+            entity_id = f"timer.schedule_{slugify(name)}"
+        else:
+            entity_id = f"timer.schedule_{schedule_id}"
+
+        entity = SchedulerTimerEntity(coordinator, hass, schedule_id, entity_id)
+        hass.data[const.DOMAIN]["schedules"][schedule_id] = entity
+        async_add_entities([entity])
+
+    for entry in coordinator.store.schedules.values():
+        async_add_entity(entry)
+
+    async_dispatcher_connect(hass, const.EVENT_ITEM_CREATED, async_add_entity)
 
 
 def has_sun(time_str: str):
@@ -79,6 +118,12 @@ class TimerHandler:
         self._sun_tracker = None
         self._workday_tracker = None
         self._watched_times: list[str] = []
+        self._calendar_entities: list[str] | None = None
+        self._calendar_match: str | None = None
+        self._calendar_lookahead_days: int | None = None
+        self._calendar_events: list[
+            tuple[datetime.datetime, datetime.datetime, str | None]
+        ] = []
 
         self.slot_queue = []
         self.timestamps = []
@@ -110,6 +155,9 @@ class TimerHandler:
             dict((k, slot[k]) for k in [const.ATTR_START, const.ATTR_STOP] if k in slot)
             for slot in data[const.ATTR_TIMESLOTS]
         ]
+        self._calendar_entities = data.get(const.ATTR_CALENDAR_ENTITIES)
+        self._calendar_match = data.get(const.ATTR_CALENDAR_MATCH)
+        self._calendar_lookahead_days = data.get(const.ATTR_CALENDAR_LOOKAHEAD)
         await self.async_start_timer()
 
     async def async_unload(self):
@@ -119,6 +167,11 @@ class TimerHandler:
         self._next_trigger = None
 
     async def async_start_timer(self):
+        if self._calendar_entities:
+            await self._update_calendar_events()
+            await self._start_calendar_timer()
+            return
+
         [current_slot, timestamp_end] = self.current_timeslot()
         [next_slot, timestamp_next] = self.next_timeslot()
 
@@ -162,6 +215,57 @@ class TimerHandler:
                 _LOGGER.debug("Timer of {} set for {}".format(self.id, timestamp))
                 await self.async_start_workday_tracker()
 
+        async_dispatcher_send(self.hass, const.EVENT_TIMER_UPDATED, self.id)
+
+    async def _update_calendar_events(self):
+        """Fetch calendar events for configured entities."""
+        now = dt_util.as_local(dt_util.utcnow())
+        lookahead = self._calendar_lookahead_days or const.CALENDAR_LOOKAHEAD_DAYS
+        end = now + datetime.timedelta(days=lookahead)
+        self._calendar_events = await async_collect_events(
+            self.hass,
+            self._calendar_entities or [],
+            now,
+            end,
+            self._calendar_match,
+        )
+
+    async def _start_calendar_timer(self):
+        """Start timer based on calendar events."""
+        now = dt_util.as_local(dt_util.utcnow())
+        current_event = next(
+            (e for e in self._calendar_events if e[0] <= now <= e[1]),
+            None,
+        )
+        next_event = next((e for e in self._calendar_events if e[0] > now), None)
+
+        timestamp_end = current_event[1] if current_event else None
+        timestamp_next = next_event[0] if next_event else None
+
+        self.slot_queue = [0] if (timestamp_next or timestamp_end) else []
+        self.timestamps = [t for t in [timestamp_next] if t is not None]
+
+        timestamp = find_closest_from_now([timestamp_end, timestamp_next])
+        self._timer_is_endpoint = (
+            timestamp != timestamp_next and timestamp == timestamp_end
+        )
+        if timestamp == timestamp_next and timestamp is not None:
+            self._next_slot = 0
+        else:
+            self._next_slot = None
+
+        self.current_slot = 0 if current_event else None
+        self._next_trigger = timestamp
+
+        if timestamp is not None:
+            if self._timer:
+                self._timer()
+            if (timestamp - now).total_seconds() < 0:
+                self._timer = None
+            else:
+                self._timer = async_track_point_in_time(
+                    self.hass, self.async_timer_finished, timestamp
+                )
         async_dispatcher_send(self.hass, const.EVENT_TIMER_UPDATED, self.id)
 
     async def async_stop_timer(self):
@@ -411,108 +515,6 @@ class TimerHandler:
                 return ts
 
 
-        class CountdownTimerHandler:
-            """Timer handler for transient countdown schedules."""
-
-            def __init__(self, hass: HomeAssistant, id: str):
-                self.hass = hass
-                self.id = id
-                self._timer = None
-                self._trigger_time: datetime.datetime | None = None
-                self._update_listener = None
-
-                self.slot_queue: list[int] = []
-                self.timestamps: list[datetime.datetime] = []
-                self.current_slot: int | None = None
-
-                self.hass.loop.create_task(self.async_reload_data())
-
-                @callback
-                async def async_item_updated(schedule_id: str):
-                    if schedule_id == self.id:
-                        await self.async_reload_data()
-
-                self._update_listener = async_dispatcher_connect(
-                    self.hass, const.EVENT_ITEM_UPDATED, async_item_updated
-                )
-
-            async def async_reload_data(self):
-                """Load countdown data and start timer."""
-                store = await async_get_registry(self.hass)
-                data = store.async_get_schedule(self.id)
-
-                if data is None:
-                    return
-
-                started_at = data.get(const.ATTR_STARTED_AT)
-                duration = data.get(const.ATTR_DURATION)
-
-                if not started_at or duration is None:
-                    self._trigger_time = None
-                    self.slot_queue = []
-                    self.timestamps = []
-                    self.current_slot = None
-                    await self.async_stop_timer()
-                    return
-
-                ts = dt_util.parse_datetime(started_at)
-                if ts is None:
-                    self._trigger_time = None
-                    await self.async_stop_timer()
-                    return
-
-                self._trigger_time = dt_util.as_local(ts) + datetime.timedelta(seconds=duration)
-                self.slot_queue = [0]
-                self.timestamps = [self._trigger_time]
-                self.current_slot = None
-                await self.async_start_timer()
-
-            async def async_unload(self):
-                """Unload countdown timer."""
-                await self.async_stop_timer()
-                if self._update_listener:
-                    self._update_listener()
-                    self._update_listener = None
-
-            async def async_start_timer(self):
-                """Start the countdown timer."""
-                if self._trigger_time is None:
-                    return
-
-                if self._timer:
-                    self._timer()
-
-                now = dt_util.as_local(dt_util.utcnow())
-                if (self._trigger_time - now).total_seconds() <= 0:
-                    _LOGGER.debug("Countdown timer %s is in the past, triggering now", self.id)
-                    self.current_slot = 0
-                    async_dispatcher_send(self.hass, const.EVENT_TIMER_FINISHED, self.id)
-                    return
-
-                self._timer = async_track_point_in_time(
-                    self.hass, self.async_timer_finished, self._trigger_time
-                )
-                _LOGGER.debug("Countdown timer %s set for %s", self.id, self._trigger_time)
-
-                async_dispatcher_send(self.hass, const.EVENT_TIMER_UPDATED, self.id)
-
-            async def async_stop_timer(self):
-                """Stop the countdown timer."""
-                if self._timer:
-                    self._timer()
-                    self._timer = None
-
-            async def async_timer_finished(self, _time):
-                """Countdown has finished."""
-                self.current_slot = 0
-                async_dispatcher_send(self.hass, const.EVENT_TIMER_FINISHED, self.id)
-                await self.async_stop_timer()
-
-            def current_timeslot(self, now: datetime.datetime | None = None):
-                """Return the current timeslot for transient timers."""
-                if self._trigger_time is None:
-                    return (None, None)
-                return (0, self._trigger_time)
         elif reverse_direction:
             time_delta = datetime.timedelta(days=-1)
 
@@ -531,6 +533,11 @@ class TimerHandler:
 
     def next_timeslot(self):
         """calculate the closest timeslot from now"""
+        if self._calendar_entities:
+            now = dt_util.as_local(dt_util.utcnow())
+            next_event = next((e for e in self._calendar_events if e[0] > now), None)
+            return (0, next_event[0] if next_event else None)
+
         now = dt_util.as_local(dt_util.utcnow())
         # calculate next start of all timeslots
         timestamps = [
@@ -562,6 +569,15 @@ class TimerHandler:
         """calculate the end of the timeslot that is overlapping now"""
         if now is None:
             now = dt_util.as_local(dt_util.utcnow())
+
+        if self._calendar_entities:
+            current_event = next(
+                (e for e in self._calendar_events if e[0] <= now <= e[1]),
+                None,
+            )
+            if current_event:
+                return (0, current_event[1])
+            return (None, None)
 
         def unwrap_end_of_day(time_str: str):
             if time_str == "00:00:00":
@@ -620,3 +636,297 @@ class TimerHandler:
                         else None,
                     )
         return (None, None)
+
+
+class CountdownTimerHandler:
+    """Timer handler for transient countdown schedules."""
+
+    def __init__(self, hass: HomeAssistant, id: str):
+        self.hass = hass
+        self.id = id
+        self._timer = None
+        self._trigger_time: datetime.datetime | None = None
+        self._update_listener = None
+
+        self.slot_queue: list[int] = []
+        self.timestamps: list[datetime.datetime] = []
+        self.current_slot: int | None = None
+
+        self.hass.loop.create_task(self.async_reload_data())
+
+        @callback
+        async def async_item_updated(schedule_id: str):
+            if schedule_id == self.id:
+                await self.async_reload_data()
+
+        self._update_listener = async_dispatcher_connect(
+            self.hass, const.EVENT_ITEM_UPDATED, async_item_updated
+        )
+
+    async def async_reload_data(self):
+        """Load countdown data and start timer."""
+        store = await async_get_registry(self.hass)
+        data = store.async_get_schedule(self.id)
+
+        if data is None:
+            return
+
+        if not data.get(const.ATTR_ENABLED, True):
+            self._trigger_time = None
+            self.slot_queue = []
+            self.timestamps = []
+            self.current_slot = None
+            await self.async_stop_timer()
+            return
+
+        started_at = data.get(const.ATTR_STARTED_AT)
+        duration = data.get(const.ATTR_DURATION)
+
+        if not started_at or duration is None:
+            self._trigger_time = None
+            self.slot_queue = []
+            self.timestamps = []
+            self.current_slot = None
+            await self.async_stop_timer()
+            return
+
+        ts = dt_util.parse_datetime(started_at)
+        if ts is None:
+            self._trigger_time = None
+            await self.async_stop_timer()
+            return
+
+        self._trigger_time = dt_util.as_local(ts) + datetime.timedelta(seconds=duration)
+        self.slot_queue = [0]
+        self.timestamps = [self._trigger_time]
+        self.current_slot = None
+        await self.async_start_timer()
+
+    async def async_unload(self):
+        """Unload countdown timer."""
+        await self.async_stop_timer()
+        if self._update_listener:
+            self._update_listener()
+            self._update_listener = None
+
+    async def async_start_timer(self):
+        """Start the countdown timer."""
+        if self._trigger_time is None:
+            return
+
+        if self._timer:
+            self._timer()
+
+        now = dt_util.as_local(dt_util.utcnow())
+        if (self._trigger_time - now).total_seconds() <= 0:
+            _LOGGER.debug("Countdown timer %s is in the past, triggering now", self.id)
+            self.current_slot = 0
+            async_dispatcher_send(self.hass, const.EVENT_TIMER_FINISHED, self.id)
+            return
+
+        self._timer = async_track_point_in_time(
+            self.hass, self.async_timer_finished, self._trigger_time
+        )
+        _LOGGER.debug("Countdown timer %s set for %s", self.id, self._trigger_time)
+
+        async_dispatcher_send(self.hass, const.EVENT_TIMER_UPDATED, self.id)
+
+    async def async_stop_timer(self):
+        """Stop the countdown timer."""
+        if self._timer:
+            self._timer()
+            self._timer = None
+
+    async def async_timer_finished(self, _time):
+        """Countdown has finished."""
+        self.current_slot = 0
+        async_dispatcher_send(self.hass, const.EVENT_TIMER_FINISHED, self.id)
+        await self.async_stop_timer()
+
+    def current_timeslot(self, now: datetime.datetime | None = None):
+        """Return the current timeslot for transient timers."""
+        if self._trigger_time is None:
+            return (None, None)
+        return (0, self._trigger_time)
+
+
+class SchedulerTimerEntity(BaseScheduleEntity, RestoreEntity):
+    """Timer entity for transient schedules."""
+
+    def __init__(self, coordinator, hass, schedule_id: str, entity_id: str) -> None:
+        BaseScheduleEntity.__init__(self, coordinator, hass, schedule_id)
+        self.entity_id = entity_id
+        self._state = STATUS_IDLE
+        self._listeners = []
+
+    async def async_added_to_hass(self) -> None:
+        await self.async_load_schedule()
+        self._listeners.append(
+            async_dispatcher_connect(
+                self.hass, const.EVENT_ITEM_UPDATED, self.async_item_updated
+            )
+        )
+        self._listeners.append(
+            async_dispatcher_connect(
+                self.hass, const.EVENT_TIMER_UPDATED, self.async_timer_updated
+            )
+        )
+        self._listeners.append(
+            async_dispatcher_connect(
+                self.hass, const.EVENT_TIMER_FINISHED, self.async_timer_finished
+            )
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        while self._listeners:
+            self._listeners.pop()()
+        if self._timer_handler:
+            await self._timer_handler.async_unload()
+
+    @callback
+    async def async_item_updated(self, schedule_id: str):
+        if schedule_id != self.schedule_id:
+            return
+        await self.async_load_schedule()
+        self.async_write_ha_state()
+
+    @callback
+    async def async_timer_updated(self, schedule_id: str):
+        if schedule_id != self.schedule_id:
+            return
+        self.async_write_ha_state()
+
+    @callback
+    async def async_timer_finished(self, schedule_id: str):
+        if schedule_id != self.schedule_id:
+            return
+        if self.schedule is None:
+            return
+
+        try:
+            await self._action_handler.async_queue_actions(
+                self.schedule[const.ATTR_TIMESLOTS][0]
+            )
+            await self._track_execution_success()
+        except Exception as err:
+            await self._track_execution_failure(str(err))
+            _LOGGER.exception(
+                "Timer schedule %s action execution failed: %s",
+                self.schedule_id,
+                err,
+            )
+
+        self._state = STATUS_IDLE
+        self.async_write_ha_state()
+        self.coordinator.async_delete_schedule(self.schedule_id)
+        await self.async_remove()
+
+    @cached_property
+    def state(self) -> str:
+        if self.schedule is None:
+            return STATUS_IDLE
+        if not self.schedule[const.ATTR_ENABLED]:
+            return STATUS_PAUSED
+        remaining = self._remaining_delta()
+        if remaining and remaining.total_seconds() > 0:
+            return STATUS_ACTIVE
+        return STATUS_IDLE
+
+    def _remaining_delta(self):
+        if self.schedule is None:
+            return None
+        if self.schedule.started_at is None or self.schedule.duration is None:
+            return None
+        started = dt_util.parse_datetime(self.schedule.started_at)
+        if started is None:
+            return None
+        end = dt_util.as_local(started) + datetime.timedelta(
+            seconds=self.schedule.duration
+        )
+        return end - dt_util.as_local(dt_util.utcnow())
+
+    @cached_property
+    def extra_state_attributes(self):
+        duration = (
+            datetime.timedelta(seconds=self.schedule.duration)
+            if self.schedule and self.schedule.duration is not None
+            else None
+        )
+        remaining = self._remaining_delta()
+        finishes_at = None
+        if self.schedule and self.schedule.started_at and self.schedule.duration:
+            started = dt_util.parse_datetime(self.schedule.started_at)
+            if started is not None:
+                finishes_at = (
+                    dt_util.as_local(started)
+                    + datetime.timedelta(seconds=self.schedule.duration)
+                ).isoformat()
+
+        attrs = {
+            TIMER_ATTR_DURATION: duration,
+            TIMER_ATTR_REMAINING: remaining,
+            TIMER_ATTR_FINISHES_AT: finishes_at,
+            "entity_type": "timer",
+        }
+        return attrs
+
+    @cached_property
+    def name(self):
+        return self.schedule.name if self.schedule else None
+
+    @cached_property
+    def unique_id(self):
+        return f"{self.schedule_id}_timer"
+
+    @callback
+    def async_start(self, duration: datetime.timedelta | None = None) -> None:
+        """Start or restart the timer."""
+        self.hass.async_create_task(self._async_start(duration))
+
+    async def _async_start(self, duration: datetime.timedelta | None = None) -> None:
+        if self.schedule is None:
+            return
+        store = await async_get_registry(self.hass)
+        duration_seconds = (
+            int(duration.total_seconds())
+            if duration is not None
+            else self.schedule.duration
+        )
+        updates = {
+            const.ATTR_STARTED_AT: dt_util.utcnow().isoformat(),
+            const.ATTR_DURATION: duration_seconds,
+            const.ATTR_ENABLED: True,
+        }
+        store.async_update_schedule(self.schedule_id, updates)
+
+    @callback
+    def async_pause(self) -> None:
+        """Pause the timer."""
+        self.hass.async_create_task(self._async_pause())
+
+    async def _async_pause(self) -> None:
+        if self.schedule is None:
+            return
+        store = await async_get_registry(self.hass)
+        store.async_update_schedule(self.schedule_id, {const.ATTR_ENABLED: False})
+
+    @callback
+    def async_cancel(self) -> None:
+        """Cancel and remove the timer."""
+        self.hass.async_create_task(self._async_cancel())
+
+    async def _async_cancel(self) -> None:
+        self.coordinator.async_delete_schedule(self.schedule_id)
+        await self.async_remove()
+
+    @callback
+    def async_get_entity_state(self):
+        """fetch schedule data for websocket API"""
+        data = {
+            const.ATTR_SCHEDULE_ID: self.schedule_id,
+            "entity_id": self.entity_id,
+            "name": self.schedule.name if self.schedule else "",
+            "entity_type": "timer",
+            const.ATTR_TIMER_TYPE: const.TIMER_TYPE_TRANSIENT,
+        }
+        return data

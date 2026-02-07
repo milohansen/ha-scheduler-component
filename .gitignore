@@ -1,3 +1,6 @@
 report
 .venv
 scratch
+
+__pycache__
+*.pyc

@@ -1,14 +1,16 @@
 """Binary sensors for Scheduler integration."""
-import logging
-from propcache import cached_property
 
-from homeassistant.core import callback
+import logging
+
 from homeassistant.components.binary_sensor import (
-    BinarySensorEntity,
     BinarySensorDeviceClass,
+    BinarySensorEntity,
 )
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.const import EntityCategory
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from propcache import cached_property
 
 from . import const
 
@@ -32,7 +34,7 @@ class SchedulerHealthBinarySensor(BinarySensorEntity):
         self._attr_name = "Scheduler Health"
         self._attr_unique_id = f"{const.DOMAIN}_health"
         self._attr_device_class = BinarySensorDeviceClass.PROBLEM
-        self._attr_entity_category = "diagnostic"
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
         self._listeners = []
 
     async def async_added_to_hass(self) -> None:

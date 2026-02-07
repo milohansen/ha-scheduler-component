@@ -1,4 +1,5 @@
 """Config flow for the Scheduler component."""
+
 import secrets
 
 from homeassistant import config_entries

@@ -27,6 +27,9 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
 )
+from homeassistant.helpers import template
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import entity_registry as er
 
 from . import const
 from .store import ScheduleEntry
@@ -49,7 +52,7 @@ ACTION_WAIT_STATE_CHANGE = "wait_state_change"
 
 def parse_service_call(data: dict, hass: HomeAssistant):
     """Turn action data into a service call using domain handlers.
-    
+
     Returns a list of service calls. Most actions return a single call,
     but domain-specific handlers may split actions into multiple calls.
     """
@@ -65,6 +68,57 @@ def parse_service_call(data: dict, hass: HomeAssistant):
     # Use domain handler registry to process the action
     registry = get_domain_handler_registry()
     return registry.process_action(service_call, hass)
+
+
+def _render_value(value, hass: HomeAssistant):
+    if isinstance(value, str):
+        tpl = template.Template(value, hass)
+        try:
+            return tpl.async_render(parse_result=False)
+        except Exception:
+            return value
+    if isinstance(value, list):
+        return [_render_value(v, hass) for v in value]
+    if isinstance(value, dict):
+        return {k: _render_value(v, hass) for k, v in value.items()}
+    return value
+
+
+def _render_service_data(service_data: dict, hass: HomeAssistant):
+    return _render_value(service_data, hass)
+
+
+def _expand_area_actions(hass: HomeAssistant, actions: list[dict]) -> list[dict]:
+    """Expand actions with area_id into entity_id actions."""
+    area_registry = ar.async_get(hass)
+    entity_registry = er.async_get(hass)
+
+    expanded: list[dict] = []
+    for action in actions:
+        area_id = action.get(const.ATTR_AREA_ID)
+        if not area_id:
+            expanded.append(action)
+            continue
+
+        if area_id not in area_registry.areas:
+            _LOGGER.warning("Area not found: %s", area_id)
+            continue
+
+        entity_ids = [
+            entry.entity_id
+            for entry in entity_registry.entities.values()
+            if entry.area_id == area_id
+        ]
+        if not entity_ids:
+            continue
+
+        for entity_id in entity_ids:
+            expanded_action = dict(action)
+            expanded_action[ATTR_ENTITY_ID] = entity_id
+            expanded_action.pop(const.ATTR_AREA_ID, None)
+            expanded.append(expanded_action)
+
+    return expanded
 
 
 def entity_is_available(hass: HomeAssistant, entity, is_target_entity=False):
@@ -119,12 +173,12 @@ def validate_condition(hass: HomeAssistant, condition: dict, *args):
 
     if isinstance(required, int):
         try:
-            actual = int(float(actual)) # type: ignore
+            actual = int(float(actual))  # type: ignore
         except (ValueError, TypeError):
             return False
     elif isinstance(required, float):
         try:
-            actual = float(actual) # type: ignore
+            actual = float(actual)  # type: ignore
         except (ValueError, TypeError):
             return False
     elif isinstance(required, str):
@@ -136,9 +190,9 @@ def validate_condition(hass: HomeAssistant, condition: dict, *args):
     elif condition[const.ATTR_MATCH_TYPE] == const.MATCH_TYPE_UNEQUAL:
         result = actual != required
     elif condition[const.ATTR_MATCH_TYPE] == const.MATCH_TYPE_BELOW:
-        result = actual < required # type: ignore
+        result = actual < required  # type: ignore
     elif condition[const.ATTR_MATCH_TYPE] == const.MATCH_TYPE_ABOVE:
-        result = actual > required # type: ignore
+        result = actual > required  # type: ignore
     else:
         result = False
 
@@ -205,7 +259,14 @@ class ActionHandler:
         await self.async_empty_queue()
 
         conditions = data[CONF_CONDITIONS]
-        actions = [e for x in data[const.ATTR_ACTIONS] for e in parse_service_call(x, self.hass)]
+        raw_actions = _expand_area_actions(self.hass, data[const.ATTR_ACTIONS])
+        actions = [e for x in raw_actions for e in parse_service_call(x, self.hass)]
+        # Render templates in service_data
+        for action in actions:
+            if CONF_SERVICE_DATA in action:
+                action[CONF_SERVICE_DATA] = _render_service_data(
+                    action[CONF_SERVICE_DATA], self.hass
+                )
         condition_type = data[const.ATTR_CONDITION_TYPE]
         track_conditions = data[const.ATTR_TRACK_CONDITIONS]
 
@@ -628,7 +689,9 @@ class ActionQueue:
                     )
 
                     if will_retry:
-                        delay = const.ACTION_RETRY_BASE_DELAY * (2 ** (current_retry - 1))
+                        delay = const.ACTION_RETRY_BASE_DELAY * (
+                            2 ** (current_retry - 1)
+                        )
                         _LOGGER.warning(
                             "[%s]: Action failed, retrying in %ss (%s/%s)",
                             self.id,

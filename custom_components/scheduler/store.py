@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_REGISTRY = f"{const.DOMAIN}_storage"
 STORAGE_KEY = f"{const.DOMAIN}.storage"
-STORAGE_VERSION = 4
+STORAGE_VERSION = 5
 SAVE_DELAY = 10
 
 
@@ -74,9 +74,16 @@ class ScheduleEntry:
     duration: int | None = None
     started_at: str | None = None
     persistent: bool | None = None
+    calendar_entities: list | None = None
+    calendar_match: str | None = None
+    calendar_lookahead_days: int | None = None
+    execution_history: list = field(default_factory=list)
 
     def __getitem__(self, item):
         return getattr(self, item)
+    
+    def get(self, item, default=None):
+        return getattr(self, item, default)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +138,9 @@ class ScheduleStorage:
             if data_version < 4:
                 data = self._migrate_to_v4(data)
                 _LOGGER.info("Migrated scheduler storage from version %d to 4", data_version)
+            if data_version < 5:
+                data = self._migrate_to_v5(data)
+                _LOGGER.info("Migrated scheduler storage from version %d to 5", data_version)
 
             if "schedules" in data:
                 for entry in data["schedules"]:
@@ -155,6 +165,10 @@ class ScheduleStorage:
                         duration=entry.get("duration"),
                         started_at=entry.get("started_at"),
                         persistent=entry.get("persistent"),
+                        calendar_entities=entry.get("calendar_entities"),
+                        calendar_match=entry.get("calendar_match"),
+                        calendar_lookahead_days=entry.get("calendar_lookahead_days"),
+                        execution_history=entry.get("execution_history", []),
                     )
 
             if "tags" in data:
@@ -192,8 +206,23 @@ class ScheduleStorage:
                 entry.setdefault("duration", None)
                 entry.setdefault("started_at", None)
                 entry.setdefault("persistent", None)
+                entry.setdefault("calendar_entities", None)
+                entry.setdefault("calendar_match", None)
+                entry.setdefault("calendar_lookahead_days", None)
         
         data["version"] = 4
+        return data
+
+    def _migrate_to_v5(self, data: dict) -> dict:
+        """Migrate storage data from v4 to v5.
+
+        Adds execution_history list to existing schedules.
+        """
+        if "schedules" in data:
+            for entry in data["schedules"]:
+                entry.setdefault("execution_history", [])
+
+        data["version"] = 5
         return data
 
     @callback
@@ -239,6 +268,10 @@ class ScheduleStorage:
                 "duration": entry.duration,
                 "started_at": entry.started_at,
                 "persistent": entry.persistent,
+                "calendar_entities": entry.calendar_entities,
+                "calendar_match": entry.calendar_match,
+                "calendar_lookahead_days": entry.calendar_lookahead_days,
+                "execution_history": entry.execution_history,
             }
             for slot in entry.timeslots:
                 timeslot = {
@@ -276,7 +309,7 @@ class ScheduleStorage:
     def async_get_schedule(self, entity_id) -> ScheduleEntry | None:
         """Get an existing ScheduleEntry by id."""
         res = self.schedules.get(entity_id)
-        return res if res else None
+        return res
 
     @callback
     def async_get_schedules(self) -> dict:
