@@ -409,6 +409,110 @@ class TimerHandler:
             else:
                 # date restrictions are met
                 return ts
+
+
+        class CountdownTimerHandler:
+            """Timer handler for transient countdown schedules."""
+
+            def __init__(self, hass: HomeAssistant, id: str):
+                self.hass = hass
+                self.id = id
+                self._timer = None
+                self._trigger_time: datetime.datetime | None = None
+                self._update_listener = None
+
+                self.slot_queue: list[int] = []
+                self.timestamps: list[datetime.datetime] = []
+                self.current_slot: int | None = None
+
+                self.hass.loop.create_task(self.async_reload_data())
+
+                @callback
+                async def async_item_updated(schedule_id: str):
+                    if schedule_id == self.id:
+                        await self.async_reload_data()
+
+                self._update_listener = async_dispatcher_connect(
+                    self.hass, const.EVENT_ITEM_UPDATED, async_item_updated
+                )
+
+            async def async_reload_data(self):
+                """Load countdown data and start timer."""
+                store = await async_get_registry(self.hass)
+                data = store.async_get_schedule(self.id)
+
+                if data is None:
+                    return
+
+                started_at = data.get(const.ATTR_STARTED_AT)
+                duration = data.get(const.ATTR_DURATION)
+
+                if not started_at or duration is None:
+                    self._trigger_time = None
+                    self.slot_queue = []
+                    self.timestamps = []
+                    self.current_slot = None
+                    await self.async_stop_timer()
+                    return
+
+                ts = dt_util.parse_datetime(started_at)
+                if ts is None:
+                    self._trigger_time = None
+                    await self.async_stop_timer()
+                    return
+
+                self._trigger_time = dt_util.as_local(ts) + datetime.timedelta(seconds=duration)
+                self.slot_queue = [0]
+                self.timestamps = [self._trigger_time]
+                self.current_slot = None
+                await self.async_start_timer()
+
+            async def async_unload(self):
+                """Unload countdown timer."""
+                await self.async_stop_timer()
+                if self._update_listener:
+                    self._update_listener()
+                    self._update_listener = None
+
+            async def async_start_timer(self):
+                """Start the countdown timer."""
+                if self._trigger_time is None:
+                    return
+
+                if self._timer:
+                    self._timer()
+
+                now = dt_util.as_local(dt_util.utcnow())
+                if (self._trigger_time - now).total_seconds() <= 0:
+                    _LOGGER.debug("Countdown timer %s is in the past, triggering now", self.id)
+                    self.current_slot = 0
+                    async_dispatcher_send(self.hass, const.EVENT_TIMER_FINISHED, self.id)
+                    return
+
+                self._timer = async_track_point_in_time(
+                    self.hass, self.async_timer_finished, self._trigger_time
+                )
+                _LOGGER.debug("Countdown timer %s set for %s", self.id, self._trigger_time)
+
+                async_dispatcher_send(self.hass, const.EVENT_TIMER_UPDATED, self.id)
+
+            async def async_stop_timer(self):
+                """Stop the countdown timer."""
+                if self._timer:
+                    self._timer()
+                    self._timer = None
+
+            async def async_timer_finished(self, _time):
+                """Countdown has finished."""
+                self.current_slot = 0
+                async_dispatcher_send(self.hass, const.EVENT_TIMER_FINISHED, self.id)
+                await self.async_stop_timer()
+
+            def current_timeslot(self, now: datetime.datetime | None = None):
+                """Return the current timeslot for transient timers."""
+                if self._trigger_time is None:
+                    return (None, None)
+                return (0, self._trigger_time)
         elif reverse_direction:
             time_delta = datetime.timedelta(days=-1)
 

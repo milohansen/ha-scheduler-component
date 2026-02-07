@@ -18,15 +18,6 @@ from homeassistant.const import (
     CONF_STATE,
     CONF_ACTION,
 )
-from homeassistant.components.climate.const import (
-    SERVICE_SET_TEMPERATURE,
-    SERVICE_SET_HVAC_MODE,
-    ATTR_CURRENT_TEMPERATURE,
-    ATTR_HVAC_MODE,
-    ATTR_TARGET_TEMP_LOW,
-    ATTR_TARGET_TEMP_HIGH,
-    DOMAIN as CLIMATE_DOMAIN,
-)
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_call_later,
@@ -39,6 +30,16 @@ from homeassistant.helpers.dispatcher import (
 
 from . import const
 from .store import ScheduleEntry
+from .domain_handlers import get_domain_handler_registry
+from homeassistant.components.climate.const import (
+    SERVICE_SET_TEMPERATURE,
+    SERVICE_SET_HVAC_MODE,
+    ATTR_CURRENT_TEMPERATURE,
+    ATTR_HVAC_MODE,
+    ATTR_TARGET_TEMP_LOW,
+    ATTR_TARGET_TEMP_HIGH,
+    DOMAIN as CLIMATE_DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,67 +47,24 @@ ACTION_WAIT = "wait"
 ACTION_WAIT_STATE_CHANGE = "wait_state_change"
 
 
-def parse_service_call(data: dict):
-    """turn action data into a service call"""
-
+def parse_service_call(data: dict, hass: HomeAssistant):
+    """Turn action data into a service call using domain handlers.
+    
+    Returns a list of service calls. Most actions return a single call,
+    but domain-specific handlers may split actions into multiple calls.
+    """
     service_call = {
         CONF_ACTION: (
             data[CONF_ACTION] if CONF_ACTION in data else data[CONF_SERVICE]
-        ),  # map service->action for backwards compaibility
+        ),  # map service->action for backwards compatibility
         CONF_SERVICE_DATA: data[ATTR_SERVICE_DATA],
     }
     if ATTR_ENTITY_ID in data and data[ATTR_ENTITY_ID]:
         service_call[ATTR_ENTITY_ID] = data[ATTR_ENTITY_ID]
 
-    if (
-        service_call[CONF_ACTION]
-        == "{}.{}".format(CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE)
-        and ATTR_HVAC_MODE in service_call[CONF_SERVICE_DATA]
-        and ATTR_ENTITY_ID in service_call
-    ):
-        # fix for climate integrations which don't support setting hvac_mode and temperature together
-        # add small delay between service calls for integrations that have a long processing time
-        # set temperature setpoint again for integrations which lose setpoint after switching hvac_mode
-        _service_call = [
-            {
-                CONF_ACTION: "{}.{}".format(CLIMATE_DOMAIN, SERVICE_SET_HVAC_MODE),
-                ATTR_ENTITY_ID: service_call[ATTR_ENTITY_ID],
-                CONF_SERVICE_DATA: {
-                    ATTR_HVAC_MODE: service_call[CONF_SERVICE_DATA][ATTR_HVAC_MODE]
-                },
-            }
-        ]
-        if (
-            ATTR_CURRENT_TEMPERATURE in service_call[CONF_SERVICE_DATA]
-            or ATTR_TARGET_TEMP_LOW in service_call[CONF_SERVICE_DATA]
-            or ATTR_TARGET_TEMP_HIGH in service_call[CONF_SERVICE_DATA]
-        ):
-            _service_call.extend(
-                [
-                    {
-                        CONF_ACTION: ACTION_WAIT_STATE_CHANGE,
-                        ATTR_ENTITY_ID: service_call[ATTR_ENTITY_ID],
-                        CONF_SERVICE_DATA: {
-                            CONF_DELAY: 50,
-                            CONF_STATE: service_call[CONF_SERVICE_DATA][ATTR_HVAC_MODE],
-                        },
-                    },
-                    {
-                        CONF_ACTION: "{}.{}".format(
-                            CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE
-                        ),
-                        ATTR_ENTITY_ID: service_call[ATTR_ENTITY_ID],
-                        CONF_SERVICE_DATA: {
-                            x: service_call[CONF_SERVICE_DATA][x]
-                            for x in service_call[CONF_SERVICE_DATA]
-                            if x != ATTR_HVAC_MODE
-                        },
-                    },
-                ]
-            )
-        return _service_call
-    else:
-        return [service_call]
+    # Use domain handler registry to process the action
+    registry = get_domain_handler_registry()
+    return registry.process_action(service_call, hass)
 
 
 def entity_is_available(hass: HomeAssistant, entity, is_target_entity=False):
@@ -247,7 +205,7 @@ class ActionHandler:
         await self.async_empty_queue()
 
         conditions = data[CONF_CONDITIONS]
-        actions = [e for x in data[const.ATTR_ACTIONS] for e in parse_service_call(x)]
+        actions = [e for x in data[const.ATTR_ACTIONS] for e in parse_service_call(x, self.hass)]
         condition_type = data[const.ATTR_CONDITION_TYPE]
         track_conditions = data[const.ATTR_TRACK_CONDITIONS]
 
@@ -338,6 +296,7 @@ class ActionQueue:
         self.queue_busy = False
         self._track_conditions = track_conditions
         self._wait_for_available = True
+        self._retry_counts: dict[int, int] = {}
 
         for condition in conditions:
             if (
@@ -635,10 +594,61 @@ class ActionQueue:
             if skip_action:
                 _LOGGER.debug("[{}]: Action has no effect, skipping".format(self.id))
             else:
-                await async_call_from_config(
-                    self.hass,
-                    task,
-                )
+                try:
+                    await async_call_from_config(
+                        self.hass,
+                        task,
+                    )
+                    self.hass.bus.async_fire(
+                        const.EVENT_ACTION_SUCCEEDED,
+                        {
+                            const.ATTR_SCHEDULE_ID: self.id,
+                            ATTR_ENTITY_ID: task.get(ATTR_ENTITY_ID),
+                            CONF_ACTION: task.get(CONF_ACTION),
+                            "attempt": self._retry_counts.get(task_idx, 0) + 1,
+                        },
+                    )
+                    if task_idx in self._retry_counts:
+                        del self._retry_counts[task_idx]
+                except Exception as err:
+                    current_retry = self._retry_counts.get(task_idx, 0) + 1
+                    self._retry_counts[task_idx] = current_retry
+
+                    will_retry = current_retry <= const.ACTION_RETRY_MAX
+                    self.hass.bus.async_fire(
+                        const.EVENT_ACTION_FAILED,
+                        {
+                            const.ATTR_SCHEDULE_ID: self.id,
+                            ATTR_ENTITY_ID: task.get(ATTR_ENTITY_ID),
+                            CONF_ACTION: task.get(CONF_ACTION),
+                            "attempt": current_retry,
+                            "error": str(err),
+                            "will_retry": will_retry,
+                        },
+                    )
+
+                    if will_retry:
+                        delay = const.ACTION_RETRY_BASE_DELAY * (2 ** (current_retry - 1))
+                        _LOGGER.warning(
+                            "[%s]: Action failed, retrying in %ss (%s/%s)",
+                            self.id,
+                            delay,
+                            current_retry,
+                            const.ACTION_RETRY_MAX,
+                        )
+
+                        @callback
+                        async def async_retry(_now) -> None:
+                            self.queue_busy = False
+                            await self.async_process_queue(task_idx)
+
+                        self._timer = async_call_later(self.hass, delay, async_retry)
+                        return
+
+                    _LOGGER.exception(
+                        "[%s]: Action failed after retries: %s", self.id, err
+                    )
+                    raise
             task_idx = task_idx + 1
 
         self.queue_busy = False

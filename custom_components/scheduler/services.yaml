@@ -178,3 +178,85 @@ disable_all:
 enable_all:
   name: Enable All
   description:  Enables all schedules
+
+run_in:
+  name: Run In
+  description: Run a sequence of actions after a specific duration
+  fields:
+    duration:
+      name: Duration
+      description: Time to wait before executing actions
+      example: '"00:10:00"'
+      required: true
+      selector:
+        duration:
+    actions:
+      name: Actions
+      description: List of service calls to execute
+      required: true
+      selector:
+        object:
+    name:
+      name: Name
+      description: Optional label for the timer
+      required: false
+      example: "My timer"
+      selector:
+        text:
+    persistent:
+      name: Persistent
+      description: Whether to persist the timer across restarts
+      required: false
+      selector:
+        boolean:
+
+validate:
+  name: Validate
+  description: Validate a schedule payload without creating it
+  fields:
+    weekdays:
+      name: Weekdays
+      description: Days of the week for which the schedule should be repeated
+      example: '["daily"]'
+      required: false
+      selector:
+        object:
+    start_date:
+      name: Start date
+      description: Date from which schedule should be executed
+      example: '"2021-01-01"'
+      required: false
+      selector:
+        object:
+    end_date:
+      name: End date
+      description: Date until which schedule should be executed
+      example: '"2021-12-31"'
+      required: false
+      selector:
+        object:
+    timeslots:
+      name: Timeslots
+      description: list of timeslots with their actions and optionally conditions (should be kept the same for all timeslots)
+      example: '[{start: "12:00", stop: "13:00", actions: [{service: "light.turn_on", entity_id: "light.my_lamp", service_data: {brightness: 200}}]}]'
+      required: true
+      selector:
+        object:
+    repeat_type:
+      name: Repeat Type
+      description: Control what happens after the schedule is triggered
+      example: '"repeat"'
+      required: true
+      selector:
+        select:
+          options:
+            - repeat
+            - single
+            - pause
+    name:
+      name: Name
+      description: Friendly name for the schedule
+      required: false
+      example: "My schedule"
+      selector:
+        text:

@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_REGISTRY = f"{const.DOMAIN}_storage"
 STORAGE_KEY = f"{const.DOMAIN}.storage"
-STORAGE_VERSION = 3
+STORAGE_VERSION = 4
 SAVE_DELAY = 10
 
 
@@ -63,6 +63,17 @@ class ScheduleEntry:
     repeat_type: str | None = None
     name: str | None = None
     enabled: bool = True
+    # Schema v4 additions
+    timer_type: str = "calendar"  # "calendar" or "transient"
+    created_at: str | None = None
+    updated_at: str | None = None
+    last_run: str | None = None
+    last_error: str | None = None
+    execution_count: int = 0
+    failure_count: int = 0
+    duration: int | None = None
+    started_at: str | None = None
+    persistent: bool | None = None
 
     def __getitem__(self, item):
         return getattr(self, item)
@@ -106,7 +117,7 @@ class ScheduleStorage:
         self.schedules: MutableMapping[str, ScheduleEntry] = {}
         self.tags: MutableMapping[str, TagEntry] = {}
         self.time_shutdown: str | None = None
-        self._store = Store(hass, 0, STORAGE_KEY, atomic_writes=True)
+        self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True)
 
     async def async_load(self) -> None:
         """Load the registry of schedule entries."""
@@ -115,6 +126,11 @@ class ScheduleStorage:
         tags: "OrderedDict[str, TagEntry]" = OrderedDict()
 
         if data is not None:
+            # Handle migration from older versions
+            data_version = data.get("version", 3)
+            if data_version < 4:
+                data = self._migrate_to_v4(data)
+                _LOGGER.info("Migrated scheduler storage from version %d to 4", data_version)
 
             if "schedules" in data:
                 for entry in data["schedules"]:
@@ -128,6 +144,17 @@ class ScheduleStorage:
                         repeat_type=entry[const.ATTR_REPEAT_TYPE],
                         name=entry[ATTR_NAME],
                         enabled=entry[const.ATTR_ENABLED],
+                        # Schema v4 fields with defaults for backwards compatibility
+                        timer_type=entry.get("timer_type", const.TIMER_TYPE_CALENDAR),
+                        created_at=entry.get("created_at"),
+                        updated_at=entry.get("updated_at"),
+                        last_run=entry.get("last_run"),
+                        last_error=entry.get("last_error"),
+                        execution_count=entry.get("execution_count", 0),
+                        failure_count=entry.get("failure_count", 0),
+                        duration=entry.get("duration"),
+                        started_at=entry.get("started_at"),
+                        persistent=entry.get("persistent"),
                     )
 
             if "tags" in data:
@@ -143,6 +170,32 @@ class ScheduleStorage:
         self.schedules = schedules
         self.tags = tags
 
+    def _migrate_to_v4(self, data: dict) -> dict:
+        """Migrate storage data from v3 to v4.
+        
+        Adds timer_type, created_at, updated_at, and error tracking fields
+        to existing schedules with default values.
+        """
+        if "schedules" in data:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            
+            for entry in data["schedules"]:
+                # Add v4 fields with defaults
+                entry.setdefault("timer_type", const.TIMER_TYPE_CALENDAR)
+                entry.setdefault("created_at", now)
+                entry.setdefault("updated_at", now)
+                entry.setdefault("last_run", None)
+                entry.setdefault("last_error", None)
+                entry.setdefault("execution_count", 0)
+                entry.setdefault("failure_count", 0)
+                entry.setdefault("duration", None)
+                entry.setdefault("started_at", None)
+                entry.setdefault("persistent", None)
+        
+        data["version"] = 4
+        return data
+
     @callback
     def async_schedule_save(self) -> None:
         """Schedule saving the registry of schedules."""
@@ -155,12 +208,17 @@ class ScheduleStorage:
     @callback
     def _data_to_save(self) -> dict:
         """Return data for the registry for schedules to store in a file."""
-        store_data = {}
+        store_data: dict = {"version": STORAGE_VERSION}
 
         store_data["schedules"] = []
         store_data["tags"] = []
 
         for entry in self.schedules.values():
+            if (
+                entry.timer_type == const.TIMER_TYPE_TRANSIENT
+                and entry.persistent is False
+            ):
+                continue
             item = {
                 const.ATTR_SCHEDULE_ID: entry.schedule_id,
                 const.ATTR_TIMESLOTS: [],
@@ -170,6 +228,17 @@ class ScheduleStorage:
                 const.ATTR_REPEAT_TYPE: entry.repeat_type,
                 ATTR_NAME: entry.name,
                 const.ATTR_ENABLED: entry.enabled,
+                # Schema v4 fields
+                "timer_type": entry.timer_type,
+                "created_at": entry.created_at,
+                "updated_at": entry.updated_at,
+                "last_run": entry.last_run,
+                "last_error": entry.last_error,
+                "execution_count": entry.execution_count,
+                "failure_count": entry.failure_count,
+                "duration": entry.duration,
+                "started_at": entry.started_at,
+                "persistent": entry.persistent,
             }
             for slot in entry.timeslots:
                 timeslot = {
@@ -220,6 +289,8 @@ class ScheduleStorage:
     @callback
     def async_create_schedule(self, data: dict) -> ScheduleEntry | None:
         """Create a new ScheduleEntry."""
+        from datetime import datetime, timezone
+        
         if const.ATTR_SCHEDULE_ID in data:
             schedule_id = data[const.ATTR_SCHEDULE_ID]
             del data[const.ATTR_SCHEDULE_ID]
@@ -229,6 +300,18 @@ class ScheduleStorage:
             schedule_id = secrets.token_hex(3)
             while schedule_id in self.schedules:
                 schedule_id = secrets.token_hex(3)
+
+        # Set timestamps for new schedules
+        now = datetime.now(timezone.utc).isoformat()
+        data.setdefault("created_at", now)
+        data.setdefault("updated_at", now)
+        data.setdefault("timer_type", const.TIMER_TYPE_CALENDAR)
+
+        if data.get("timer_type") == const.TIMER_TYPE_TRANSIENT:
+            data.setdefault("started_at", now)
+            duration = data.get("duration")
+            if duration is not None and data.get("persistent") is None:
+                data["persistent"] = duration >= 300
 
         data = parse_schedule_data(data)
         new_schedule = ScheduleEntry(**data, schedule_id=schedule_id)
@@ -248,8 +331,14 @@ class ScheduleStorage:
     @callback
     def async_update_schedule(self, schedule_id: str, changes: dict) -> ScheduleEntry:
         """Update existing ScheduleEntry."""
+        from datetime import datetime, timezone
+        
         old = self.schedules[schedule_id]
         changes = parse_schedule_data(changes)
+        
+        # Update the updated_at timestamp
+        changes["updated_at"] = datetime.now(timezone.utc).isoformat()
+        
         new = self.schedules[schedule_id] = replace(old, **changes)
         self.async_schedule_save()
         return new

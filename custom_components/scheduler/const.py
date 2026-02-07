@@ -1,4 +1,5 @@
 """Store constants."""
+import logging
 import voluptuous as vol
 import re
 import homeassistant.util.dt as dt_util
@@ -45,6 +46,13 @@ REPEAT_TYPE_REPEAT = "repeat"
 REPEAT_TYPE_SINGLE = "single"
 REPEAT_TYPE_PAUSE = "pause"
 
+ATTR_TIMER_TYPE = "timer_type"
+TIMER_TYPE_CALENDAR = "calendar"
+TIMER_TYPE_TRANSIENT = "transient"
+ATTR_DURATION = "duration"
+ATTR_STARTED_AT = "started_at"
+ATTR_PERSISTENT = "persistent"
+
 EVENT = "scheduler_updated"
 
 SERVICE_REMOVE = "remove"
@@ -53,6 +61,8 @@ SERVICE_ADD = "add"
 SERVICE_COPY = "copy"
 SERVICE_DISABLE_ALL = "disable_all"
 SERVICE_ENABLE_ALL = "enable_all"
+SERVICE_VALIDATE = "validate"
+SERVICE_RUN_IN = "run_in"
 
 OffsetTimePattern = re.compile(r"^([a-z]+)([-|\+]{1})([0-9:]+)$")
 DatePattern = re.compile(r"^[0-9]+\-[0-9]+\-[0-9]+$")
@@ -77,10 +87,15 @@ EVENT_ITEM_CREATED = "scheduler_item_created"
 EVENT_ITEM_REMOVED = "scheduler_item_removed"
 EVENT_STARTED = "scheduler_started"
 EVENT_WORKDAY_SENSOR_UPDATED = "workday_sensor_updated"
+EVENT_ACTION_SUCCEEDED = "scheduler_action_succeeded"
+EVENT_ACTION_FAILED = "scheduler_action_failed"
 
 STATE_INIT = "init"
 STATE_READY = "ready"
 STATE_COMPLETED = "completed"
+
+ACTION_RETRY_MAX = 3
+ACTION_RETRY_BASE_DELAY = 5
 
 
 def validate_time(time):
@@ -180,6 +195,12 @@ ADD_SCHEDULE_SCHEMA = vol.Schema(
                 REPEAT_TYPE_PAUSE,
             ]
         ),
+        vol.Optional(ATTR_TIMER_TYPE, default=TIMER_TYPE_CALENDAR): vol.In(
+            [
+                TIMER_TYPE_CALENDAR,
+                TIMER_TYPE_TRANSIENT,
+            ]
+        ),
         vol.Optional(ATTR_NAME): vol.Any(cv.string, None),
         vol.Optional(ATTR_TAGS): vol.All(cv.ensure_list, vol.Unique(), [cv.string]),
     }
@@ -214,7 +235,72 @@ EDIT_SCHEDULE_SCHEMA = vol.Schema(
                 REPEAT_TYPE_PAUSE,
             ]
         ),
+        vol.Optional(ATTR_TIMER_TYPE): vol.In(
+            [
+                TIMER_TYPE_CALENDAR,
+                TIMER_TYPE_TRANSIENT,
+            ]
+        ),
         vol.Optional(ATTR_NAME): vol.Any(cv.string, None),
         vol.Optional(ATTR_TAGS): vol.All(cv.ensure_list, vol.Unique(), [cv.string]),
     }
 )
+
+RUN_IN_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_DURATION): cv.time_period,
+        vol.Required(ATTR_ACTIONS): vol.All(
+            cv.ensure_list, vol.Length(min=1), [ACTION_SCHEMA]
+        ),
+        vol.Optional(ATTR_NAME): vol.Any(cv.string, None),
+        vol.Optional(ATTR_PERSISTENT): cv.boolean,
+    }
+)
+
+
+class SchedulerLogger:
+    """Structured logging wrapper for scheduler component.
+    
+    Provides context-aware logging with schedule_id tagging for easier
+    debugging and troubleshooting.
+    """
+
+    def __init__(self, name: str):
+        """Initialize the logger."""
+        self._logger = logging.getLogger(name)
+
+    def _format_message(self, msg: str, schedule_id: str | None = None, **kwargs) -> str:
+        """Format message with schedule context."""
+        if schedule_id:
+            msg = f"[{schedule_id}] {msg}"
+        if kwargs:
+            # Add extra context as key=value pairs
+            context = " ".join(f"{k}={v}" for k, v in kwargs.items())
+            msg = f"{msg} ({context})"
+        return msg
+
+    def debug(self, msg: str, schedule_id: str | None = None, **kwargs):
+        """Log debug message."""
+        self._logger.debug(self._format_message(msg, schedule_id, **kwargs))
+
+    def info(self, msg: str, schedule_id: str | None = None, **kwargs):
+        """Log info message."""
+        self._logger.info(self._format_message(msg, schedule_id, **kwargs))
+
+    def warning(self, msg: str, schedule_id: str | None = None, **kwargs):
+        """Log warning message."""
+        self._logger.warning(self._format_message(msg, schedule_id, **kwargs))
+
+    def error(self, msg: str, schedule_id: str | None = None, **kwargs):
+        """Log error message."""
+        self._logger.error(self._format_message(msg, schedule_id, **kwargs))
+
+    def exception(self, msg: str, schedule_id: str | None = None, **kwargs):
+        """Log exception with traceback."""
+        self._logger.exception(self._format_message(msg, schedule_id, **kwargs))
+
+
+def get_logger(name: str) -> SchedulerLogger:
+    """Get a structured logger for the scheduler component."""
+    return SchedulerLogger(name)
+

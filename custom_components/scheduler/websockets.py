@@ -22,7 +22,12 @@ class SchedulesListView(HomeAssistantView):
     async def get(self, request):
         hass = request.app["hass"]
         coordinator = hass.data[const.DOMAIN]["coordinator"]
-        schedules = coordinator.async_get_schedules()
+        include_transient = request.query.get("include_transient", "false").lower() in [
+            "1",
+            "true",
+            "yes",
+        ]
+        schedules = coordinator.async_get_schedules(include_transient=include_transient)
         return self.json(schedules)
 
 
@@ -81,7 +86,8 @@ class SchedulesRemoveView(HomeAssistantView):
 def websocket_get_schedules(hass, connection, msg):
     """Publish scheduler list data."""
     coordinator = hass.data[const.DOMAIN]["coordinator"]
-    schedules = coordinator.async_get_schedules()
+    include_transient = msg.get("include_transient", False)
+    schedules = coordinator.async_get_schedules(include_transient=include_transient)
     connection.send_result(msg["id"], schedules)
 
 
@@ -239,6 +245,7 @@ async def async_register_websockets(hass):
         vol.Schema(
             {
                 vol.Required("type"): const.DOMAIN,
+                vol.Optional("include_transient", default=False): cv.boolean,
             }
         ),
     )

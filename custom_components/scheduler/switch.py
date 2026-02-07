@@ -35,10 +35,12 @@ from homeassistant.helpers.event import (
 from homeassistant.util import slugify
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
+    async_dispatcher_send,
 )
+from homeassistant.components.persistent_notification import async_create as async_create_notification
 from . import const
 from .store import ScheduleEntry, async_get_registry
-from .timer import TimerHandler
+from .timer import TimerHandler, CountdownTimerHandler
 from .actions import ActionHandler
 
 _LOGGER = logging.getLogger(__name__)
@@ -144,6 +146,12 @@ class ScheduleEntity(ToggleEntity):
             ),
         ]
 
+    def _create_timer_handler(self):
+        """Create a timer handler based on schedule type."""
+        if self.schedule and self.schedule.timer_type == const.TIMER_TYPE_TRANSIENT:
+            return CountdownTimerHandler(self.hass, self.schedule_id)
+        return TimerHandler(self.hass, self.schedule_id)
+
     @callback
     async def async_item_updated(self, id: str):
         """update internal properties when schedule config was changed"""
@@ -156,6 +164,19 @@ class ScheduleEntity(ToggleEntity):
 
         if self.schedule is None:
             raise ValueError(f"Schedule with id {self.schedule_id} not found in store")
+
+        # Create or recreate timer handler if type changed
+        if not hasattr(self, "_timer_handler") or self._timer_handler is None:
+            self._timer_handler = self._create_timer_handler()
+        else:
+            expected_handler = (
+                CountdownTimerHandler
+                if self.schedule.timer_type == const.TIMER_TYPE_TRANSIENT
+                else TimerHandler
+            )
+            if not isinstance(self._timer_handler, expected_handler):
+                await self._timer_handler.async_unload()
+                self._timer_handler = self._create_timer_handler()
 
         if self.schedule[const.ATTR_ENABLED] and self._state in [
             STATE_OFF,
@@ -291,9 +312,25 @@ class ScheduleEntity(ToggleEntity):
                 _LOGGER.debug(
                     f"Schedule {self.schedule_id} is triggered, proceed with actions"
                 )
-                await self._action_handler.async_queue_actions(
-                    self.schedule[const.ATTR_TIMESLOTS][self._current_slot]
-                )
+                try:
+                    await self._action_handler.async_queue_actions(
+                        self.schedule[const.ATTR_TIMESLOTS][self._current_slot]
+                    )
+                    # Track successful execution
+                    await self._track_execution_success()
+                except Exception as err:
+                    # Track failed execution
+                    await self._track_execution_failure(str(err))
+                    _LOGGER.exception(
+                        f"Schedule {self.schedule_id} action execution failed: {err}"
+                    )
+
+        if self.schedule is not None and self.schedule.timer_type == const.TIMER_TYPE_TRANSIENT:
+            self._state = const.STATE_COMPLETED
+            self.async_write_ha_state()
+            self.coordinator.async_delete_schedule(self.schedule_id)
+            await self.async_remove()
+            return
 
         @callback
         async def async_trigger_finished(_now):
@@ -315,6 +352,50 @@ class ScheduleEntity(ToggleEntity):
         if self._timer:
             self._timer()
             self._timer = None
+
+    async def _track_execution_success(self):
+        """Track successful action execution."""
+        from datetime import datetime, timezone
+        
+        store = await async_get_registry(self.hass)
+        now = datetime.now(timezone.utc).isoformat()
+        
+        updates = {
+            "last_run": now,
+            "last_error": None,
+            "execution_count": self.schedule.execution_count + 1,
+        }
+        
+        self.schedule = store.async_update_schedule(self.schedule_id, updates)
+        async_dispatcher_send(self.hass, const.EVENT_ITEM_UPDATED, self.schedule_id)
+        _LOGGER.debug(f"Schedule {self.schedule_id} executed successfully")
+
+    async def _track_execution_failure(self, error_message: str):
+        """Track failed action execution."""
+        from datetime import datetime, timezone
+        
+        store = await async_get_registry(self.hass)
+        now = datetime.now(timezone.utc).isoformat()
+        
+        updates = {
+            "last_run": now,
+            "last_error": error_message,
+            "execution_count": self.schedule.execution_count + 1,
+            "failure_count": self.schedule.failure_count + 1,
+        }
+        
+        self.schedule = store.async_update_schedule(self.schedule_id, updates)
+        async_dispatcher_send(self.hass, const.EVENT_ITEM_UPDATED, self.schedule_id)
+
+        async_create_notification(
+            self.hass,
+            f"Schedule '{self.schedule.name or self.schedule_id}' failed: {error_message}",
+            title="Scheduler Action Failed",
+            notification_id=f"scheduler_error_{self.schedule_id}",
+        )
+        _LOGGER.error(
+            f"Schedule {self.schedule_id} execution failed: {error_message}"
+        )
 
     @cached_property
     def device_info(self) -> DeviceInfo:
@@ -421,6 +502,23 @@ class ScheduleEntity(ToggleEntity):
             "tags": self.tags,
         }
 
+        # Add error tracking information from schema v4
+        if self.schedule:
+            output["last_run"] = self.schedule.last_run
+            output["last_error"] = self.schedule.last_error
+            output["execution_count"] = self.schedule.execution_count
+            output["failure_count"] = self.schedule.failure_count
+            
+            # Add error_info for UI/automation use
+            if self.schedule.last_error:
+                output["error_info"] = {
+                    "message": self.schedule.last_error,
+                    "timestamp": self.schedule.last_run,
+                    "has_error": True,
+                }
+            else:
+                output["error_info"] = {"has_error": False}
+
         return output
 
     @cached_property
@@ -461,7 +559,7 @@ class ScheduleEntity(ToggleEntity):
         self.schedule = store.async_get_schedule(self.schedule_id)
         self._tags = self.coordinator.async_get_tags_for_schedule(self.schedule_id)
 
-        self._timer_handler = TimerHandler(self.hass, self.schedule_id)
+        self._timer_handler = self._create_timer_handler()
         self._action_handler = ActionHandler(self.hass, self.schedule_id)
 
     async def async_turn_off(self, **kwargs: Any):

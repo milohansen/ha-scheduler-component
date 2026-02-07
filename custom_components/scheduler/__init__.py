@@ -8,10 +8,13 @@ import logging
 import homeassistant.util.dt as dt_util
 import voluptuous as vol
 from homeassistant.components.switch.const import DOMAIN as PLATFORM
+from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_PLATFORM
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_NAME,
+    ATTR_SERVICE,
+    CONF_CONDITIONS,
     EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
 )
@@ -64,9 +67,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     if entry.unique_id is None:
         hass.config_entries.async_update_entry(entry, unique_id=coordinator.id)
 
-    await hass.config_entries.async_forward_entry_setups(entry, [PLATFORM])
+    await hass.config_entries.async_forward_entry_setups(
+        entry, [PLATFORM, BINARY_SENSOR_PLATFORM]
+    )
 
     await async_register_websockets(hass)
+
+    def _validate_schedule_data(data: dict) -> None:
+        """Validate schedule data for entities and services availability."""
+        timeslots = data.get(const.ATTR_TIMESLOTS, [])
+
+        for timeslot in timeslots:
+            # validate conditions
+            for condition in timeslot.get(CONF_CONDITIONS, []) or []:
+                entity_id = condition.get(ATTR_ENTITY_ID)
+                if entity_id and hass.states.get(entity_id) is None:
+                    raise vol.Invalid(f"Condition entity not found: {entity_id}")
+
+            # validate actions
+            for action in timeslot.get(const.ATTR_ACTIONS, []) or []:
+                service = action.get(ATTR_SERVICE)
+                if not service or "." not in service:
+                    raise vol.Invalid(f"Invalid service format: {service}")
+
+                domain, service_name = service.split(".", 1)
+                if not hass.services.has_service(domain, service_name):
+                    raise vol.Invalid(f"Service not found: {service}")
+
+                entity_id = action.get(ATTR_ENTITY_ID)
+                if entity_id and hass.states.get(entity_id) is None:
+                    raise vol.Invalid(f"Action entity not found: {entity_id}")
 
     @callback
     def service_create_schedule(service):
@@ -77,6 +107,61 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         const.SERVICE_ADD,
         service_create_schedule,
         schema=const.ADD_SCHEDULE_SCHEMA,
+    )
+
+    @callback
+    def service_validate_schedule(service):
+        data = dict(service.data)
+        _validate_schedule_data(data)
+
+    hass.services.async_register(
+        const.DOMAIN,
+        const.SERVICE_VALIDATE,
+        service_validate_schedule,
+        schema=const.ADD_SCHEDULE_SCHEMA,
+    )
+
+    @callback
+    def service_run_in(service):
+        data = dict(service.data)
+        duration = data[const.ATTR_DURATION]
+        actions = data[const.ATTR_ACTIONS]
+        name = data.get(ATTR_NAME)
+        persistent = data.get(const.ATTR_PERSISTENT)
+
+        duration_seconds = int(duration.total_seconds())
+        now = dt_util.utcnow().isoformat()
+
+        if persistent is None:
+            persistent = duration_seconds >= 300
+
+        schedule_data = {
+            const.ATTR_WEEKDAYS: [],
+            const.ATTR_START_DATE: None,
+            const.ATTR_END_DATE: None,
+            const.ATTR_TIMESLOTS: [
+                {
+                    const.ATTR_ACTIONS: actions,
+                    const.ATTR_START: None,
+                    const.ATTR_STOP: None,
+                }
+            ],
+            const.ATTR_REPEAT_TYPE: const.REPEAT_TYPE_SINGLE,
+            ATTR_NAME: name,
+            const.ATTR_ENABLED: True,
+            const.ATTR_TIMER_TYPE: const.TIMER_TYPE_TRANSIENT,
+            const.ATTR_DURATION: duration_seconds,
+            const.ATTR_STARTED_AT: now,
+            const.ATTR_PERSISTENT: persistent,
+        }
+
+        coordinator.async_create_schedule(schedule_data)
+
+    hass.services.async_register(
+        const.DOMAIN,
+        const.SERVICE_RUN_IN,
+        service_run_in,
+        schema=const.RUN_IN_SCHEMA,
     )
 
     @callback
@@ -181,7 +266,12 @@ async def async_unload_entry(hass, entry):
     """Unload Scheduler config entry."""
     unload_ok = all(
         await asyncio.gather(
-            *[hass.config_entries.async_forward_entry_unload(entry, PLATFORM)]
+            *[
+                hass.config_entries.async_forward_entry_unload(entry, PLATFORM),
+                hass.config_entries.async_forward_entry_unload(
+                    entry, BINARY_SENSOR_PLATFORM
+                ),
+            ]
         )
     )
     coordinator = hass.data[const.DOMAIN]["coordinator"]
@@ -257,12 +347,17 @@ class SchedulerCoordinator(DataUpdateCoordinator):
         item = self.hass.data[const.DOMAIN]["schedules"][schedule_id]
         return item.async_get_entity_state()
 
-    def async_get_schedules(self):
+    def async_get_schedules(self, include_transient: bool = False):
         """fetch a list of schedules (websocket API hook)"""
         schedules = self.hass.data[const.DOMAIN]["schedules"]
         data = []
         for item in schedules.values():
             config = item.async_get_entity_state()
+            if (
+                not include_transient
+                and config.get(const.ATTR_TIMER_TYPE) == const.TIMER_TYPE_TRANSIENT
+            ):
+                continue
             data.append(config)
         return data
 
