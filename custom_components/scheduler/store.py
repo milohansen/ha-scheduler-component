@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_REGISTRY = f"{const.DOMAIN}_storage"
 STORAGE_KEY = f"{const.DOMAIN}.storage"
-STORAGE_VERSION = 3
+STORAGE_VERSION = 4
 SAVE_DELAY = 10
 
 
@@ -63,6 +63,15 @@ class ScheduleEntry:
     repeat_type: str | None = None
     name: str | None = None
     enabled: bool = True
+    created_at: str | None = None
+    updated_at: str | None = None
+    timer_type: str = "calendar"
+    last_run: str | None = None
+    last_error: str | None = None
+    execution_count: int = 0
+    failure_count: int = 0
+    persistent: bool = True
+    history: list = field(default_factory=list)
 
     def __getitem__(self, item):
         return getattr(self, item)
@@ -106,7 +115,7 @@ class ScheduleStorage:
         self.schedules: MutableMapping[str, ScheduleEntry] = {}
         self.tags: MutableMapping[str, TagEntry] = {}
         self.time_shutdown: str | None = None
-        self._store = Store(hass, 0, STORAGE_KEY, atomic_writes=True)
+        self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True)
 
     async def async_load(self) -> None:
         """Load the registry of schedule entries."""
@@ -128,6 +137,15 @@ class ScheduleStorage:
                         repeat_type=entry[const.ATTR_REPEAT_TYPE],
                         name=entry[ATTR_NAME],
                         enabled=entry[const.ATTR_ENABLED],
+                        created_at=entry.get("created_at"),
+                        updated_at=entry.get("updated_at"),
+                        timer_type=entry.get("timer_type", "calendar"),
+                        last_run=entry.get("last_run"),
+                        last_error=entry.get("last_error"),
+                        execution_count=entry.get("execution_count", 0),
+                        failure_count=entry.get("failure_count", 0),
+                        persistent=entry.get("persistent", True),
+                        history=entry.get("history", []),
                     )
 
             if "tags" in data:
@@ -161,6 +179,8 @@ class ScheduleStorage:
         store_data["tags"] = []
 
         for entry in self.schedules.values():
+            if not entry.persistent:
+                continue
             item = {
                 const.ATTR_SCHEDULE_ID: entry.schedule_id,
                 const.ATTR_TIMESLOTS: [],
@@ -170,6 +190,15 @@ class ScheduleStorage:
                 const.ATTR_REPEAT_TYPE: entry.repeat_type,
                 ATTR_NAME: entry.name,
                 const.ATTR_ENABLED: entry.enabled,
+                "created_at": entry.created_at,
+                "updated_at": entry.updated_at,
+                "timer_type": entry.timer_type,
+                "last_run": entry.last_run,
+                "last_error": entry.last_error,
+                "execution_count": entry.execution_count,
+                "failure_count": entry.failure_count,
+                "persistent": entry.persistent,
+                "history": entry.history,
             }
             for slot in entry.timeslots:
                 timeslot = {
@@ -233,15 +262,18 @@ class ScheduleStorage:
         data = parse_schedule_data(data)
         new_schedule = ScheduleEntry(**data, schedule_id=schedule_id)
         self.schedules[schedule_id] = new_schedule
-        self.async_schedule_save()
+        if new_schedule.persistent:
+            self.async_schedule_save()
         return new_schedule
 
     @callback
     def async_delete_schedule(self, schedule_id: str) -> bool:
         """Delete ScheduleEntry."""
         if schedule_id in self.schedules:
+            persistent = self.schedules[schedule_id].persistent
             del self.schedules[schedule_id]
-            self.async_schedule_save()
+            if persistent:
+                self.async_schedule_save()
             return True
         return False
 
@@ -251,7 +283,8 @@ class ScheduleStorage:
         old = self.schedules[schedule_id]
         changes = parse_schedule_data(changes)
         new = self.schedules[schedule_id] = replace(old, **changes)
-        self.async_schedule_save()
+        if new.persistent:
+            self.async_schedule_save()
         return new
 
     @callback

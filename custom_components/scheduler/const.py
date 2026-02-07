@@ -53,6 +53,8 @@ SERVICE_ADD = "add"
 SERVICE_COPY = "copy"
 SERVICE_DISABLE_ALL = "disable_all"
 SERVICE_ENABLE_ALL = "enable_all"
+SERVICE_VALIDATE = "validate"
+SERVICE_RUN_IN = "run_in"
 
 OffsetTimePattern = re.compile(r"^([a-z]+)([-|\+]{1})([0-9:]+)$")
 DatePattern = re.compile(r"^[0-9]+\-[0-9]+\-[0-9]+$")
@@ -81,6 +83,9 @@ EVENT_WORKDAY_SENSOR_UPDATED = "workday_sensor_updated"
 STATE_INIT = "init"
 STATE_READY = "ready"
 STATE_COMPLETED = "completed"
+
+TIMER_TYPE_CALENDAR = "calendar"
+TIMER_TYPE_TRANSIENT = "transient"
 
 
 def validate_time(time):
@@ -218,3 +223,34 @@ EDIT_SCHEDULE_SCHEMA = vol.Schema(
         vol.Optional(ATTR_TAGS): vol.All(cv.ensure_list, vol.Unique(), [cv.string]),
     }
 )
+
+RUN_IN_SCHEMA = vol.Schema(
+    {
+        vol.Required("duration"): cv.time_period,
+        vol.Required(ATTR_ACTIONS): vol.All(cv.ensure_list, vol.Length(min=1), [ACTION_SCHEMA]),
+        vol.Optional(ATTR_NAME): cv.string,
+    }
+)
+
+
+class SchedulerLogger:
+    def __init__(self, logger, schedule_id=None):
+        self._logger = logger
+        self._schedule_id = schedule_id
+
+    def _format(self, message):
+        if self._schedule_id:
+            return f"[{self._schedule_id}]: {message}"
+        return message
+
+    def debug(self, message, *args, **kwargs):
+        self._logger.debug(self._format(message), *args, **kwargs)
+
+    def info(self, message, *args, **kwargs):
+        self._logger.info(self._format(message), *args, **kwargs)
+
+    def warning(self, message, *args, **kwargs):
+        self._logger.warning(self._format(message), *args, **kwargs)
+
+    def error(self, message, *args, **kwargs):
+        self._logger.error(self._format(message), *args, **kwargs)

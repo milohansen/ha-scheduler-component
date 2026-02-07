@@ -69,17 +69,19 @@ class TimerHandler:
         """init"""
         self.hass = hass
         self.id = id
+        self._timer = None
+        self._next_trigger = None
+        self._timer_type = const.TIMER_TYPE_CALENDAR
+
+        # For recurrence
         self._weekdays = []
         self._start_date = None
         self._end_date = None
         self._timeslots = []
-        self._timer = None
-        self._next_trigger = None
         self._next_slot = None
         self._sun_tracker = None
         self._workday_tracker = None
         self._watched_times: list[str] = []
-
         self.slot_queue = []
         self.timestamps = []
         self.current_slot = None
@@ -103,6 +105,25 @@ class TimerHandler:
         if data is None:
             return
 
+        self._timer_type = data.timer_type
+
+        if self._timer_type == const.TIMER_TYPE_TRANSIENT:
+            # For transient timers, we expect a duration or a fixed trigger time
+            # For now, let's assume it's stored in a way we can use
+            # Refactor plan suggested: trigger_time = created_at + duration
+            if data.created_at and data.timeslots and data.timeslots[0].start:
+                # In transient mode, we might repurpose timeslots[0].start as duration or just use it as fixed time
+                # If it's a duration like "00:10:00"
+                try:
+                    duration = dt_util.parse_duration(data.timeslots[0].start)
+                    created_at = dt_util.parse_datetime(data.created_at)
+                    if duration and created_at:
+                        self._next_trigger = dt_util.as_local(created_at + duration)
+                except Exception:
+                    pass
+            await self.async_start_timer()
+            return
+
         self._weekdays = data[const.ATTR_WEEKDAYS]
         self._start_date = data[const.ATTR_START_DATE]
         self._end_date = data[const.ATTR_END_DATE]
@@ -119,6 +140,21 @@ class TimerHandler:
         self._next_trigger = None
 
     async def async_start_timer(self):
+        if self._timer_type == const.TIMER_TYPE_TRANSIENT:
+            if self._next_trigger is not None:
+                if self._timer:
+                    self._timer()
+
+                now = dt_util.as_local(dt_util.utcnow())
+                if self._next_trigger <= now:
+                    await self.async_timer_finished(now)
+                else:
+                    self._timer = async_track_point_in_time(
+                        self.hass, self.async_timer_finished, self._next_trigger
+                    )
+                async_dispatcher_send(self.hass, const.EVENT_TIMER_UPDATED, self.id)
+            return
+
         [current_slot, timestamp_end] = self.current_timeslot()
         [next_slot, timestamp_next] = self.next_timeslot()
 
@@ -174,6 +210,9 @@ class TimerHandler:
 
     async def async_start_sun_tracker(self):
         """check for changes in the sun sensor"""
+        if self._timer_type == const.TIMER_TYPE_TRANSIENT:
+            return
+
         if (
             self._next_trigger is not None
             and any(has_sun(x) for x in self._watched_times)
@@ -226,6 +265,9 @@ class TimerHandler:
 
     async def async_start_workday_tracker(self):
         """check for changes in the workday sensor"""
+        if self._timer_type == const.TIMER_TYPE_TRANSIENT:
+            return
+
         if (
             const.DAY_TYPE_WORKDAY in self._weekdays
             or const.DAY_TYPE_WEEKEND in self._weekdays
@@ -269,6 +311,10 @@ class TimerHandler:
 
     async def async_timer_finished(self, _time):
         """the timer is finished"""
+        if self._timer_type == const.TIMER_TYPE_TRANSIENT:
+            async_dispatcher_send(self.hass, const.EVENT_TIMER_FINISHED, self.id)
+            return
+
         if not self._timer_is_endpoint:
             # timer marks the start of a new timeslot
             self.current_slot = self._next_slot
