@@ -14,12 +14,14 @@ from homeassistant.const import (
     ATTR_NAME,
     EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
+    CONF_CONDITIONS,
 )
 from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
     async_dispatcher_send,
 )
 from homeassistant.helpers.entity_registry import async_get as get_entity_registry
@@ -64,7 +66,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     if entry.unique_id is None:
         hass.config_entries.async_update_entry(entry, unique_id=coordinator.id)
 
-    await hass.config_entries.async_forward_entry_setups(entry, [PLATFORM])
+    await hass.config_entries.async_forward_entry_setups(entry, [PLATFORM, "binary_sensor", "timer", "calendar"])
 
     await async_register_websockets(hass)
 
@@ -137,7 +139,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
             if data is None:
                 raise vol.Invalid(f"Schedule not found: {match}")
-            
+
             data = asdict(data)
 
             tags = coordinator.async_get_tags_for_schedule(data[const.ATTR_SCHEDULE_ID])
@@ -174,6 +176,61 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         const.DOMAIN, const.SERVICE_ENABLE_ALL, async_service_enable_all
     )
 
+    @callback
+    def async_service_validate(service):
+        """Validate schedule data."""
+        data = service.data
+        for slot in data.get(const.ATTR_TIMESLOTS, []):
+            for action in slot.get(const.ATTR_ACTIONS, []):
+                entity_id = action.get(ATTR_ENTITY_ID)
+                if entity_id and not hass.states.get(entity_id):
+                    raise vol.Invalid(f"Entity {entity_id} not found")
+
+                service_name = action.get(const.ATTR_SERVICE)
+                domain, svc = service_name.split(".")
+                if not hass.services.has_service(domain, svc):
+                    raise vol.Invalid(f"Service {service_name} not found")
+
+            for condition in slot.get(CONF_CONDITIONS, []):
+                entity_id = condition.get(ATTR_ENTITY_ID)
+                if not hass.states.get(entity_id):
+                    raise vol.Invalid(f"Condition entity {entity_id} not found")
+        _LOGGER.info("Validation successful")
+
+    hass.services.async_register(
+        const.DOMAIN,
+        const.SERVICE_VALIDATE,
+        async_service_validate,
+        schema=const.ADD_SCHEDULE_SCHEMA,
+    )
+
+    @callback
+    def async_service_run_in(service):
+        """Create a transient schedule."""
+        duration = service.data["duration"]
+        actions = service.data[const.ATTR_ACTIONS]
+        name = service.data.get(ATTR_NAME)
+
+        schedule_data = {
+            const.ATTR_TIMESLOTS: [{
+                const.ATTR_START: str(duration),
+                const.ATTR_ACTIONS: actions,
+            }],
+            const.ATTR_REPEAT_TYPE: const.REPEAT_TYPE_SINGLE,
+            ATTR_NAME: name,
+            "timer_type": const.TIMER_TYPE_TRANSIENT,
+            "created_at": dt_util.utcnow().isoformat(),
+            "persistent": False if duration.total_seconds() < 300 else True,
+        }
+        coordinator.async_create_schedule(schedule_data)
+
+    hass.services.async_register(
+        const.DOMAIN,
+        const.SERVICE_RUN_IN,
+        async_service_run_in,
+        schema=const.RUN_IN_SCHEMA,
+    )
+
     return True
 
 
@@ -181,7 +238,10 @@ async def async_unload_entry(hass, entry):
     """Unload Scheduler config entry."""
     unload_ok = all(
         await asyncio.gather(
-            *[hass.config_entries.async_forward_entry_unload(entry, PLATFORM)]
+            *[hass.config_entries.async_forward_entry_unload(entry, PLATFORM),
+              hass.config_entries.async_forward_entry_unload(entry, "binary_sensor"),
+              hass.config_entries.async_forward_entry_unload(entry, "timer"),
+              hass.config_entries.async_forward_entry_unload(entry, "calendar")]
         )
     )
     coordinator = hass.data[const.DOMAIN]["coordinator"]
@@ -250,6 +310,41 @@ class SchedulerCoordinator(DataUpdateCoordinator):
 
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_handle_shutdown)
 
+        # Listen for action execution events to update history
+        async_dispatcher_connect(
+            self.hass, "scheduler_action_executed", self._async_handle_action_executed
+        )
+
+    @callback
+    def _async_handle_action_executed(self, schedule_id: str, success: bool, error: str = None):
+        """Update schedule execution history and statistics."""
+        schedule = self.store.async_get_schedule(schedule_id)
+        if not schedule:
+            return
+
+        now = dt_util.utcnow().isoformat()
+        history_entry = {
+            "timestamp": now,
+            "success": success,
+            "error": error
+        }
+
+        new_history = [history_entry] + (schedule.history or [])
+        new_history = new_history[:20] # Keep last 20 runs
+
+        changes = {
+            "last_run": now,
+            "execution_count": schedule.execution_count + 1,
+            "history": new_history
+        }
+
+        if not success:
+            changes["last_error"] = error
+            changes["failure_count"] = schedule.failure_count + 1
+
+        self.store.async_update_schedule(schedule_id, changes)
+        async_dispatcher_send(self.hass, const.EVENT_ITEM_UPDATED, schedule_id)
+
     def async_get_schedule(self, schedule_id: str):
         """fetch a schedule (websocket API hook)"""
         if schedule_id not in self.hass.data[const.DOMAIN]["schedules"]:
@@ -273,6 +368,11 @@ class SchedulerCoordinator(DataUpdateCoordinator):
         if const.ATTR_TAGS in data:
             tags = data[const.ATTR_TAGS]
             del data[const.ATTR_TAGS]
+
+        if "created_at" not in data:
+            data["created_at"] = dt_util.utcnow().isoformat()
+        data["updated_at"] = dt_util.utcnow().isoformat()
+
         res = self.store.async_create_schedule(data)
         if res:
             self.async_assign_tags_to_schedule(res.schedule_id, tags or [])
@@ -299,6 +399,8 @@ class SchedulerCoordinator(DataUpdateCoordinator):
             tags_updated = True
             tags = data[const.ATTR_TAGS]
             del data[const.ATTR_TAGS]
+
+        data["updated_at"] = dt_util.utcnow().isoformat()
 
         entry = self.store.async_update_schedule(schedule_id, data)
         if tags_updated:
